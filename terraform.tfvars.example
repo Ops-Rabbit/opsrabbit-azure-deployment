@@ -1,0 +1,45 @@
+subscription_id                   = "<azure-subscription-uuid>"
+location                          = "eastus2"
+resource_group_name               = "rg-opsrabbit-customer"
+create_resource_group             = true
+network_mode                      = "public"
+container_registry_name           = "<globally-unique-acr-name>"
+storage_account_name              = "<globallyuniquestorage>"
+postgresql_server_name            = "<globally-unique-postgresql-name>"
+terraform_runner_public_ip        = "<stable-runner-public-ipv4>"
+
+identity_name        = "id-opsrabbit-aci"
+container_group_name = "aci-opsrabbit"
+dns_name_label       = "<globally-unique-aci-dns-label>"
+
+# For a private deployment, set network_mode = "private", set
+# terraform_runner_public_ip and dns_name_label to null, and provide the
+# customer-owned network configuration below. The three subnets must be
+# distinct and in subscription_id and location. See README.md for delegation,
+# NAT Gateway, service-endpoint, DNS-link, and access requirements.
+#
+# private_network = {
+#   aci_subnet_id                  = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<aci-subnet>"
+#   postgresql_subnet_id           = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<postgresql-subnet>"
+#   private_endpoint_subnet_id     = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<private-endpoint-subnet>"
+#   acr_private_dns_zone_id        = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/privateDnsZones/privatelink.azurecr.io"
+#   postgresql_private_dns_zone_id = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/privateDnsZones/<customer>.postgres.database.azure.com"
+#   application_origin             = "https://opsrabbit.internal.example.com"
+#   dns_servers                    = ["10.0.0.4"]
+# }
+
+backend_image_repository = "opsrabbit/backend-aci"
+backend_image_digest     = "sha256:<backend-digest-from-release-manifest>"
+web_image_repository     = "opsrabbit/web"
+web_image_digest         = "sha256:<web-digest-from-release-manifest>"
+
+# Keep false for the bootstrap apply. Set true only after both images have been
+# imported into the customer ACR and their digests have been verified.
+container_group_enabled = false
+
+tags = {
+  application = "opsrabbit"
+  managed-by  = "terraform"
+  owner       = "<customer-owner>"
+  environment = "<customer-environment>"
+}
