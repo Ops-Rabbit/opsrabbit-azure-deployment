@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Security fixes are made on the default `develop` branch. Use the latest
+Security fixes are made on the default `main` branch. Use the latest
 revision when reporting or validating a potential issue.
 
 ## Reporting a vulnerability
