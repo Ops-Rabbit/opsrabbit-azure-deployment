@@ -70,7 +70,8 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
 - Azure CLI authenticated to the target tenant and subscription
 - Terraform `1.15.x`
 - approved OpsRabbit release manifest
-- short-lived read access to the OpsRabbit ECR repositories
+- short-lived read access to the OpsRabbit ECR repositories, supplied securely
+  by OpsRabbit
 - for public mode, a stable public IPv4 address for the Terraform runner
 - for private mode, a Terraform runner connected to the customer network and
   the private-network foundations described below
@@ -346,6 +347,9 @@ Do not continue to image verification when either lookup fails or returns only
 a public address.
 
 ## 5. Import the finished images from OpsRabbit ECR
+
+The customer runs these commands using the short-lived ECR token supplied by
+OpsRabbit. The customer does not need an AWS account or AWS CLI.
 
 Set values from the release manifest:
 
