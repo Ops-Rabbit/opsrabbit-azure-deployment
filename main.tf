@@ -36,6 +36,16 @@ data "azurerm_virtual_network" "private" {
   resource_group_name = each.value[4]
 }
 
+data "azapi_resource" "container_apps_subnet" {
+  for_each = local.private_network_enabled && var.deployment_target == "aca" && local.compute_subnet_id != null ? {
+    compute = local.compute_subnet_id
+  } : {}
+
+  type                   = "Microsoft.Network/virtualNetworks/subnets@2024-05-01"
+  resource_id            = each.value
+  response_export_values = ["properties.delegations"]
+}
+
 resource "azurerm_container_registry" "opsrabbit" {
   name                = var.container_registry_name
   resource_group_name = var.resource_group_name
@@ -59,8 +69,8 @@ resource "azurerm_container_registry" "opsrabbit" {
     }
 
     precondition {
-      condition     = !local.private_network_enabled || contains(data.azurerm_subnet.private["aci"].service_endpoints, "Microsoft.Storage")
-      error_message = "The private ACI subnet must enable the Microsoft.Storage service endpoint for Azure Files volume mounts."
+      condition     = !local.private_network_enabled || contains(data.azurerm_subnet.private["compute"].service_endpoints, "Microsoft.Storage")
+      error_message = "The private compute subnet must enable the Microsoft.Storage service endpoint for Azure Files volume mounts."
     }
 
     precondition {
@@ -118,7 +128,7 @@ resource "azurerm_storage_account" "opsrabbit" {
   allow_nested_items_to_be_public = false
 
   dynamic "network_rules" {
-    for_each = local.private_network_enabled ? [var.private_network.aci_subnet_id] : []
+    for_each = local.private_network_enabled ? [local.compute_subnet_id] : []
 
     content {
       default_action             = "Deny"
@@ -284,7 +294,7 @@ resource "azurerm_private_endpoint" "container_registry" {
 }
 
 resource "azurerm_container_group" "opsrabbit" {
-  count = var.container_group_enabled ? 1 : 0
+  count = local.aci_enabled ? 1 : 0
 
   name                = var.container_group_name
   resource_group_name = var.resource_group_name

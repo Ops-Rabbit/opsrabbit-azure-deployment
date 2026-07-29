@@ -5,12 +5,12 @@ provider "azurerm" {
   resource_providers_to_register = concat(
     [
       "Microsoft.Authorization",
-      "Microsoft.ContainerInstance",
       "Microsoft.ContainerRegistry",
       "Microsoft.DBforPostgreSQL",
       "Microsoft.ManagedIdentity",
       "Microsoft.Storage",
     ],
+    var.deployment_target == "aca" ? ["Microsoft.App"] : ["Microsoft.ContainerInstance"],
     var.network_mode == "private" ? ["Microsoft.Network"] : [],
   )
 

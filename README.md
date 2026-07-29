@@ -1,4 +1,4 @@
-# OpsRabbit Azure Container Instances Terraform
+# OpsRabbit Azure Terraform
 
 This package creates the Azure resources for a fresh OpsRabbit deployment. It
 supports public or private networking and can create a dedicated resource group
@@ -8,11 +8,11 @@ or use an existing customer-owned group.
   private endpoint for private mode
 - user-assigned image-pull identity and `AcrPull` permission
 - Azure Files shares for application data and Git workspaces, restricted to the
-  ACI subnet in private mode
+  selected compute subnet in private mode
 - Azure Database for PostgreSQL Flexible Server 16
 - the PostgreSQL `vector` extension
-- one Azure Container Instances group containing the ready-to-run OpsRabbit
-  backend and web images
+- either one Azure Container Instances group or one Azure Container App
+  containing the ready-to-run OpsRabbit backend and web images
 
 OpsRabbit builds the images and publishes them in OpsRabbit Amazon ECR. The
 customer does not build or modify images.
@@ -20,11 +20,11 @@ customer does not build or modify images.
 ## Security modes
 
 Private networking is recommended for production and customer environments. It
-keeps ACI, PostgreSQL, and ACR off public endpoints and requires a
+keeps the selected container platform, PostgreSQL, and ACR off public endpoints and requires a
 customer-managed internal entry point.
 
 Public networking remains the default for backward compatibility and controlled
-evaluation. It gives ACI a public address, keeps authenticated Azure Files
+evaluation. It gives the selected container platform a public address, keeps authenticated Azure Files
 publicly reachable, and uses a public PostgreSQL endpoint restricted by
 firewall rules. Public mode is not the recommended production security
 baseline.
@@ -34,13 +34,15 @@ restrict state access, and follow the secret-handling requirements below.
 
 ## Tested toolchain
 
-The package was written and validated on 23 July 2026 with:
+The package was validated on 29 July 2026 with:
 
 | Component | Version |
 |---|---:|
 | Terraform CLI | `1.15.8` |
 | AzureRM provider | `4.81.0` |
 | PostgreSQL provider | `1.27.0` |
+| AzAPI provider | `2.11.0` |
+| Random provider | `3.9.0` |
 
 The exact provider versions are pinned in `versions.tf` and checksummed in
 `.terraform.lock.hcl`.
@@ -53,6 +55,7 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
 | `providers.tf` | Azure and PostgreSQL provider configuration |
 | `variables.tf` | Required customer inputs and validation |
 | `main.tf` | Azure and PostgreSQL resources |
+| `container-apps.tf` | Azure Container Apps resources |
 | `outputs.tf` | Deployment addresses and resource names |
 | `terraform.tfvars.example` | Secret-free customer input example |
 | `backend.tf.example` | Remote Azure state-backend example |
@@ -67,7 +70,8 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
   private endpoint to the supplied private DNS zone
 - when customer-owned private DNS zones are supplied, permission to read them
   and create the required private-endpoint zone association
-- Azure CLI authenticated to the target tenant and subscription
+- Azure CLI authenticated to the target tenant and subscription, with the
+  `containerapp` extension when deploying ACA
 - Terraform `1.15.x`
 - approved OpsRabbit release manifest
 - short-lived read access to the OpsRabbit ECR repositories, supplied securely
@@ -84,7 +88,7 @@ Terraform state contains:
 - the PostgreSQL administrator password
 - `BETTER_AUTH_SECRET`
 - `OPSRABBIT_NODE_ENCRYPTION_KEY`
-- the Azure Files storage account key used by ACI
+- the Azure Files storage account key used by the selected container platform
 
 Configure an encrypted remote backend with tightly restricted access before the
 first real apply. Do not use local state for a customer deployment. Do not commit
@@ -111,6 +115,26 @@ cp terraform.tfvars.example terraform.tfvars
 
 Replace every placeholder. Use the immutable image digests from the approved
 OpsRabbit release manifest.
+
+### Container platform
+
+Azure Container Instances remains the default:
+
+```hcl
+deployment_target = "aci"
+```
+
+To deploy the standard non-root backend image on Azure Container Apps instead:
+
+```hcl
+deployment_target              = "aca"
+dns_name_label                 = null
+container_app_environment_name = "cae-opsrabbit"
+container_app_name             = "ca-opsrabbit"
+```
+
+When `backend_image_repository` is omitted, Terraform selects
+`opsrabbit/backend-aci` for ACI and `opsrabbit/backend` for ACA.
 
 ### Resource-group ownership
 
@@ -151,7 +175,8 @@ runner address. Azure Files and ACR retain authenticated public endpoints.
 
 ### Private networking
 
-Private mode disables public network access for ACI, PostgreSQL, and ACR. It
+Private mode disables public network access for the selected container platform,
+PostgreSQL, and ACR. It
 creates an ACR private endpoint and restricts Azure Files to the ACI subnet
 through the Microsoft.Storage service endpoint required by ACI volume mounts.
 It uses customer-owned subnets and private DNS zones.
@@ -164,6 +189,9 @@ The customer must prepare:
 - an operational NAT Gateway on the ACI subnet, with at least one public IP
   address or public IP prefix, for supported outbound connectivity
 - the `Microsoft.Storage` service endpoint enabled on the ACI subnet
+- when `deployment_target = "aca"`, a dedicated `/27` or larger infrastructure
+  subnet delegated to `Microsoft.App/environments`, supplied as
+  `container_apps_subnet_id` instead of `aci_subnet_id`
 - a PostgreSQL-only `/28` or larger subnet delegated to
   `Microsoft.DBforPostgreSQL/flexibleServers`
 - a separate subnet that allows the ACR private endpoint
@@ -189,7 +217,7 @@ dns_name_label             = null
 terraform_runner_public_ip = null
 
 private_network = {
-  aci_subnet_id                  = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<aci-subnet>"
+  aci_subnet_id                  = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<aci-subnet>" # use container_apps_subnet_id for ACA
   postgresql_subnet_id           = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<postgresql-subnet>"
   private_endpoint_subnet_id     = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<private-endpoint-subnet>"
   acr_private_dns_zone_id        = "/subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/privateDnsZones/privatelink.azurecr.io"
@@ -289,15 +317,15 @@ Private mode uses Premium ACR because ACR private endpoints are not available
 on Basic. Trusted Azure-services access remains enabled so the documented
 server-side ECR import and managed-identity ACI image pull continue to work.
 
-The backend digest must identify the ready-to-run ACI image that starts as root
-for Azure Files mount setup and then launches OpsRabbit as `opsbot`. Do not
-substitute the standard non-root backend image. The customer does not build this
-wrapper.
+For ACI, the backend digest must identify the ready-to-run ACI image that starts
+as root for Azure Files mount setup and then launches OpsRabbit as `opsbot`. For
+ACA, use the standard non-root backend image. The customer does not build either
+image.
 
 Keep this value disabled for the first apply:
 
 ```hcl
-container_group_enabled = false
+application_enabled = false
 ```
 
 ## 3. Supply secrets without a variable file
@@ -332,8 +360,9 @@ terraform apply bootstrap.tfplan
 rm -f bootstrap.tfplan
 ```
 
-The bootstrap apply creates ACR, PostgreSQL, `vector`, Azure Files, and the
-managed identity. It does not create the ACI group.
+The bootstrap apply creates ACR, PostgreSQL, `vector`, Azure Files, the managed
+identity, and the ACA environment when selected. It does not create the
+application workload.
 
 In private mode, confirm the records created during bootstrap now resolve to
 private addresses from the Terraform runner:
@@ -356,12 +385,13 @@ Set values from the release manifest:
 ```bash
 export RELEASE="<approved-release>"
 export OPSRABBIT_ECR_REGISTRY="<opsrabbit-ecr-registry>"
-export BACKEND_ECR_REPOSITORY="<backend-aci-repository>"
+export BACKEND_ECR_REPOSITORY="<backend-aci-repository-for-ACI-or-backend-repository-for-ACA>"
 export WEB_ECR_REPOSITORY="<web-repository>"
 export BACKEND_IMAGE_DIGEST="<backend-sha256-digest>"
 export WEB_IMAGE_DIGEST="<web-sha256-digest>"
 
 export CUSTOMER_ACR_NAME="$(terraform output -raw container_registry_name)"
+export BACKEND_ACR_REPOSITORY="$(terraform output -raw backend_image_repository)"
 export SOURCE_REGISTRY_USER="AWS"
 
 read -r -s -p "OpsRabbit ECR access token: " SOURCE_REGISTRY_PASSWORD
@@ -374,7 +404,7 @@ Import directly between registries:
 az acr import \
   --name "$CUSTOMER_ACR_NAME" \
   --source "${OPSRABBIT_ECR_REGISTRY}/${BACKEND_ECR_REPOSITORY}@${BACKEND_IMAGE_DIGEST}" \
-  --image "opsrabbit/backend-aci:${RELEASE}" \
+  --image "${BACKEND_ACR_REPOSITORY}:${RELEASE}" \
   --username "$SOURCE_REGISTRY_USER" \
   --password "$SOURCE_REGISTRY_PASSWORD"
 
@@ -393,7 +423,7 @@ Verify that ACR retained the approved digests:
 ```bash
 test "$(az acr repository show \
   --name "$CUSTOMER_ACR_NAME" \
-  --image "opsrabbit/backend-aci:${RELEASE}" \
+  --image "${BACKEND_ACR_REPOSITORY}:${RELEASE}" \
   --query digest --output tsv)" = "$BACKEND_IMAGE_DIGEST"
 
 test "$(az acr repository show \
@@ -411,12 +441,12 @@ Azure-services access; a network-restricted registry needs that exception for
 operations, so the Terraform runner must resolve and route to the ACR private
 endpoint even though it does not transfer image layers.
 
-## 6. Deploy the ACI group
+## 6. Deploy the application
 
 Set the following value in `terraform.tfvars`:
 
 ```hcl
-container_group_enabled = true
+application_enabled = true
 ```
 
 Then review and apply:
@@ -433,11 +463,19 @@ rm -f deployment.tfplan
 ```bash
 terraform output
 
-az container show \
-  --resource-group "$(terraform output -raw resource_group_name)" \
-  --name "$(terraform output -raw container_group_name)" \
-  --query 'containers[].{name:name,state:instanceView.currentState.state,restarts:instanceView.restartCount}' \
-  --output table
+if [ "$(terraform output -raw deployment_target)" = "aca" ]; then
+  az containerapp show \
+    --resource-group "$(terraform output -raw resource_group_name)" \
+    --name "$(terraform output -raw container_app_name)" \
+    --query '{name:name,revision:properties.latestReadyRevisionName,fqdn:properties.configuration.ingress.fqdn}' \
+    --output table
+else
+  az container show \
+    --resource-group "$(terraform output -raw resource_group_name)" \
+    --name "$(terraform output -raw container_group_name)" \
+    --query 'containers[].{name:name,state:instanceView.currentState.state,restarts:instanceView.restartCount}' \
+    --output table
+fi
 ```
 
 For public mode:
@@ -471,6 +509,10 @@ curl --fail --show-error \
   "$(terraform output -raw opsrabbit_url)/api/health"
 ```
 
+For private ACA, configure customer DNS and the internal entry point for the
+customer-approved `private_network.application_origin`; the Container Apps
+environment itself remains inaccessible from the public internet.
+
 Expected health response:
 
 ```json
@@ -490,7 +532,8 @@ Do not change the PostgreSQL database, storage account, shares, Better Auth
 secret, or OpsRabbit encryption key during a routine image upgrade.
 
 Do not change `network_mode` during a routine upgrade. Moving an existing
-deployment between public and private networking can replace ACI and PostgreSQL.
+deployment between public and private networking can replace the selected
+container platform and PostgreSQL.
 The stateful-resource protection intentionally blocks that conversion. Treat it
 as a separately planned migration with backups, restore testing, DNS changes,
 and a cutover plan.

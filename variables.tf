@@ -46,10 +46,22 @@ variable "network_mode" {
   }
 }
 
+variable "deployment_target" {
+  description = "Azure container platform used for OpsRabbit. ACI remains the backward-compatible default; ACA selects Azure Container Apps."
+  type        = string
+  default     = "aci"
+
+  validation {
+    condition     = contains(["aci", "aca"], var.deployment_target)
+    error_message = "deployment_target must be either aci or aca."
+  }
+}
+
 variable "private_network" {
   description = "Customer-owned subnets, private DNS zones, and internal origin required when network_mode is private."
   type = object({
-    aci_subnet_id                  = string
+    aci_subnet_id                  = optional(string)
+    container_apps_subnet_id       = optional(string)
     postgresql_subnet_id           = string
     private_endpoint_subnet_id     = string
     acr_private_dns_zone_id        = string
@@ -66,34 +78,41 @@ variable "private_network" {
   }
 
   validation {
+    condition = var.network_mode != "private" || var.private_network == null || (
+      var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id != null, false) : try(var.private_network.aci_subnet_id != null, false)
+    )
+    error_message = "private_network must supply the subnet required by deployment_target: aci_subnet_id for ACI or container_apps_subnet_id for ACA."
+  }
+
+  validation {
     condition = var.private_network == null || alltrue([
-      for subnet_id in [
-        var.private_network.aci_subnet_id,
+      for subnet_id in compact([
+        var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null),
         var.private_network.postgresql_subnet_id,
         var.private_network.private_endpoint_subnet_id,
-      ] : can(regex("(?i)^/subscriptions/[0-9a-f-]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/virtualNetworks/[^/]+/subnets/[^/]+$", subnet_id))
+      ]) : can(regex("(?i)^/subscriptions/[0-9a-f-]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/virtualNetworks/[^/]+/subnets/[^/]+$", subnet_id))
     ])
     error_message = "Each private_network subnet must be a complete Azure subnet resource ID."
   }
 
   validation {
     condition = var.private_network == null || alltrue([
-      for subnet_id in [
-        var.private_network.aci_subnet_id,
+      for subnet_id in compact([
+        var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null),
         var.private_network.postgresql_subnet_id,
         var.private_network.private_endpoint_subnet_id,
-      ] : try(lower(split("/", subnet_id)[2]) == lower(var.subscription_id), false)
+      ]) : try(lower(split("/", subnet_id)[2]) == lower(var.subscription_id), false)
     ])
     error_message = "All private_network subnets must be in subscription_id."
   }
 
   validation {
     condition = var.private_network == null || length(toset([
-      lower(var.private_network.aci_subnet_id),
+      var.deployment_target == "aca" ? try(lower(var.private_network.container_apps_subnet_id), "") : try(lower(var.private_network.aci_subnet_id), ""),
       lower(var.private_network.postgresql_subnet_id),
       lower(var.private_network.private_endpoint_subnet_id),
     ])) == 3
-    error_message = "ACI, PostgreSQL, and private endpoints must use three distinct subnets."
+    error_message = "The selected compute platform, PostgreSQL, and private endpoints must use three distinct subnets."
   }
 
   validation {
@@ -237,13 +256,14 @@ variable "terraform_runner_public_ip" {
 }
 
 variable "identity_name" {
-  description = "User-assigned identity used by ACI to pull from ACR."
+  description = "User-assigned identity used by the selected container platform to pull from ACR."
   type        = string
 }
 
 variable "container_group_name" {
   description = "ACI container group name."
   type        = string
+  default     = "aci-opsrabbit"
 }
 
 variable "dns_name_label" {
@@ -253,21 +273,56 @@ variable "dns_name_label" {
   nullable    = true
 
   validation {
-    condition     = var.network_mode != "public" || (var.dns_name_label != null && length(var.dns_name_label) >= 3 && length(var.dns_name_label) <= 63 && can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", var.dns_name_label)))
+    condition     = var.deployment_target != "aci" || var.network_mode != "public" || (var.dns_name_label != null && length(var.dns_name_label) >= 3 && length(var.dns_name_label) <= 63 && can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", var.dns_name_label)))
     error_message = "dns_name_label must contain 3-63 lowercase letters, numbers, or hyphens and cannot start or end with a hyphen when network_mode is public."
   }
 }
 
-variable "container_group_enabled" {
-  description = "Create the ACI group after both release images have been imported into ACR."
+variable "application_enabled" {
+  description = "Create the selected OpsRabbit application workload after both release images have been imported into ACR."
   type        = bool
   default     = false
 }
 
-variable "backend_image_repository" {
-  description = "Backend repository name inside the customer ACR."
+variable "container_group_enabled" {
+  description = "Deprecated compatibility alias for application_enabled. When set, this value takes precedence."
+  type        = bool
+  default     = null
+  nullable    = true
+}
+
+variable "container_app_environment_name" {
+  description = "Azure Container Apps managed environment name used when deployment_target is aca."
   type        = string
-  default     = "opsrabbit/backend-aci"
+  default     = "cae-opsrabbit"
+
+  validation {
+    condition     = length(var.container_app_environment_name) >= 2 && length(var.container_app_environment_name) <= 60 && can(regex("^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$", var.container_app_environment_name))
+    error_message = "container_app_environment_name must contain 2-60 letters, numbers, or hyphens and cannot start or end with a hyphen."
+  }
+}
+
+variable "container_app_name" {
+  description = "Azure Container App name used when deployment_target is aca."
+  type        = string
+  default     = "ca-opsrabbit"
+
+  validation {
+    condition     = length(var.container_app_name) >= 2 && length(var.container_app_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.container_app_name))
+    error_message = "container_app_name must contain 2-32 lowercase letters, numbers, or hyphens, start with a letter, and end with a letter or number."
+  }
+}
+
+variable "backend_image_repository" {
+  description = "Backend repository name inside the customer ACR. Defaults to opsrabbit/backend-aci for ACI and opsrabbit/backend for ACA."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.backend_image_repository == null || can(regex("^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$", var.backend_image_repository))
+    error_message = "backend_image_repository must be a valid lowercase container repository path when supplied."
+  }
 }
 
 variable "backend_image_digest" {
@@ -362,6 +417,17 @@ variable "web_memory_gb" {
   description = "Web requested memory in GiB."
   type        = number
   default     = 0.5
+}
+
+variable "container_app_web_memory_gb" {
+  description = "Web-container memory in GiB for ACA. The default makes the combined 2.5 vCPU and 5 GiB allocation valid on the Consumption profile."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.container_app_web_memory_gb >= 0.5
+    error_message = "container_app_web_memory_gb must be at least 0.5 GiB."
+  }
 }
 
 variable "tags" {
