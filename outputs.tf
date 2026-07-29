@@ -14,13 +14,23 @@ output "container_registry_login_server" {
 }
 
 output "backend_image" {
-  description = "Immutable backend image reference used by ACI."
+  description = "Immutable backend image reference used by the selected container platform."
   value       = local.backend_image
 }
 
+output "backend_image_repository" {
+  description = "Resolved backend repository inside the customer ACR."
+  value       = local.backend_image_repository
+}
+
 output "web_image" {
-  description = "Immutable web image reference used by ACI."
+  description = "Immutable web image reference used by the selected container platform."
   value       = local.web_image
+}
+
+output "deployment_target" {
+  description = "Selected Azure container platform."
+  value       = var.deployment_target
 }
 
 output "postgresql_host" {
@@ -45,20 +55,35 @@ output "git_workspace_share_name" {
 
 output "container_group_fqdn" {
   description = "Public ACI FQDN, or null for private networking and before ACI is enabled."
-  value       = var.container_group_enabled && !local.private_network_enabled ? azurerm_container_group.opsrabbit[0].fqdn : null
+  value       = local.aci_enabled && !local.private_network_enabled ? azurerm_container_group.opsrabbit[0].fqdn : null
 }
 
 output "container_group_ip_address" {
-  description = "ACI public or private IP address, or null until container_group_enabled is true."
-  value       = var.container_group_enabled ? azurerm_container_group.opsrabbit[0].ip_address : null
+  description = "ACI public or private IP address, or null until application_enabled is true."
+  value       = local.aci_enabled ? azurerm_container_group.opsrabbit[0].ip_address : null
 }
 
 output "container_group_name" {
-  description = "ACI container group name, or null until container_group_enabled is true."
-  value       = var.container_group_enabled ? azurerm_container_group.opsrabbit[0].name : null
+  description = "ACI container group name, or null until application_enabled is true."
+  value       = local.aci_enabled ? azurerm_container_group.opsrabbit[0].name : null
+}
+
+output "container_app_environment_name" {
+  description = "Azure Container Apps environment name, or null when ACA is not selected."
+  value       = var.deployment_target == "aca" ? azurerm_container_app_environment.opsrabbit[0].name : null
+}
+
+output "container_app_name" {
+  description = "Azure Container App name, or null until the ACA workload is enabled."
+  value       = local.container_app_enabled ? azurerm_container_app.opsrabbit[0].name : null
+}
+
+output "container_app_fqdn" {
+  description = "Azure Container App ingress FQDN, or null until the ACA workload is enabled."
+  value       = local.container_app_enabled ? azurerm_container_app.opsrabbit[0].ingress[0].fqdn : null
 }
 
 output "opsrabbit_url" {
-  description = "OpsRabbit URL, or null until container_group_enabled is true."
-  value       = var.container_group_enabled ? local.application_origin : null
+  description = "OpsRabbit URL, or null until the selected application workload is enabled."
+  value       = local.application_enabled ? local.application_origin : null
 }

@@ -221,7 +221,7 @@ run "private_application_topology" {
   command = plan
 
   override_data {
-    target = data.azurerm_subnet.private["aci"]
+    target = data.azurerm_subnet.private["compute"]
     values = {
       service_endpoints = ["Microsoft.Storage"]
     }
@@ -235,7 +235,7 @@ run "private_application_topology" {
   }
 
   override_data {
-    target = data.azurerm_virtual_network.private["aci"]
+    target = data.azurerm_virtual_network.private["compute"]
     values = {
       location = "eastus2"
     }
@@ -444,7 +444,7 @@ run "reject_private_network_in_another_region" {
   command = plan
 
   override_data {
-    target = data.azurerm_subnet.private["aci"]
+    target = data.azurerm_subnet.private["compute"]
     values = {
       service_endpoints = ["Microsoft.Storage"]
     }
@@ -458,7 +458,7 @@ run "reject_private_network_in_another_region" {
   }
 
   override_data {
-    target = data.azurerm_virtual_network.private["aci"]
+    target = data.azurerm_virtual_network.private["compute"]
     values = {
       location = "westus2"
     }
@@ -509,7 +509,7 @@ run "reject_private_aci_subnet_without_storage_endpoint" {
   }
 
   override_data {
-    target = data.azurerm_virtual_network.private["aci"]
+    target = data.azurerm_virtual_network.private["compute"]
     values = {
       location = "eastus2"
     }
@@ -553,7 +553,7 @@ run "reject_private_postgresql_subnet_smaller_than_slash_28" {
   command = plan
 
   override_data {
-    target = data.azurerm_subnet.private["aci"]
+    target = data.azurerm_subnet.private["compute"]
     values = {
       service_endpoints = ["Microsoft.Storage"]
     }
@@ -567,7 +567,7 @@ run "reject_private_postgresql_subnet_smaller_than_slash_28" {
   }
 
   override_data {
-    target = data.azurerm_virtual_network.private["aci"]
+    target = data.azurerm_virtual_network.private["compute"]
     values = {
       location = "eastus2"
     }
