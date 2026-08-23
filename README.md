@@ -34,14 +34,14 @@ restrict state access, and follow the secret-handling requirements below.
 
 ## Tested toolchain
 
-The package was validated on 29 July 2026 with:
+The package was validated on 23 August 2026 with:
 
 | Component | Version |
 |---|---:|
-| Terraform CLI | `1.15.8` |
-| AzureRM provider | `4.81.0` |
+| Terraform CLI | `1.15.9` |
+| AzureRM provider | `5.2.0` |
 | PostgreSQL provider | `1.27.0` |
-| AzAPI provider | `2.11.0` |
+| AzAPI provider | `2.12.0` |
 | Random provider | `3.9.0` |
 
 The exact provider versions are pinned in `versions.tf` and checksummed in

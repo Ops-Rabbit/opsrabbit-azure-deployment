@@ -69,7 +69,9 @@ resource "azurerm_container_registry" "opsrabbit" {
     }
 
     precondition {
-      condition     = !local.private_network_enabled || contains(data.azurerm_subnet.private["compute"].service_endpoints, "Microsoft.Storage")
+      condition = !local.private_network_enabled || contains([
+        for endpoint in data.azurerm_subnet.private["compute"].service_endpoint : endpoint.service
+      ], "Microsoft.Storage")
       error_message = "The private compute subnet must enable the Microsoft.Storage service endpoint for Azure Files volume mounts."
     }
 
