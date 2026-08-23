@@ -223,7 +223,10 @@ run "private_application_topology" {
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
-      service_endpoints = ["Microsoft.Storage"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
     }
   }
 
@@ -446,7 +449,10 @@ run "reject_private_network_in_another_region" {
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
-      service_endpoints = ["Microsoft.Storage"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
     }
   }
 
@@ -555,7 +561,10 @@ run "reject_private_postgresql_subnet_smaller_than_slash_28" {
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
-      service_endpoints = ["Microsoft.Storage"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
     }
   }
 

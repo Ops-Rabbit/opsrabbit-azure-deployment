@@ -258,8 +258,11 @@ run "complete_private_aca_topology" {
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
-      address_prefixes  = ["10.20.0.0/27"]
-      service_endpoints = ["Microsoft.Storage"]
+      address_prefixes = ["10.20.0.0/27"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
     }
   }
 
@@ -371,8 +374,11 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
-      address_prefixes  = ["10.20.0.0/28"]
-      service_endpoints = ["Microsoft.Storage"]
+      address_prefixes = ["10.20.0.0/28"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
     }
   }
 
@@ -440,8 +446,11 @@ run "reject_private_aca_subnet_without_delegation" {
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
-      address_prefixes  = ["10.20.0.0/27"]
-      service_endpoints = ["Microsoft.Storage"]
+      address_prefixes = ["10.20.0.0/27"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
     }
   }
 
