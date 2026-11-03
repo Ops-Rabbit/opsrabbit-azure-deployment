@@ -274,6 +274,11 @@ class AzureSandboxService(SandboxService, ExtensionService):
                     json={
                         "sandboxId": sid,
                         "generation": 1,
+                        "envs": {
+                            "LD_LIBRARY_PATH": "/usr/local/lib",
+                            "PATH": "/usr/local/bin:/usr/bin:/bin",
+                            "HOME": "/workspace",
+                        },
                         "accessTokenHash": "sha256:"
                         + hashlib.sha256(token.encode()).hexdigest(),
                     },

@@ -53,6 +53,14 @@ class AdapterTests(unittest.TestCase):
         if request.url.path == "/internal/init":
             binding = json.loads(request.content)
             self.assertTrue(binding["accessTokenHash"].startswith("sha256:"))
+            self.assertEqual(
+                binding["envs"],
+                {
+                    "LD_LIBRARY_PATH": "/usr/local/lib",
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "HOME": "/workspace",
+                },
+            )
             return httpx.Response(
                 200, json={"status": "initialized", "sandboxId": sid, "generation": 1}
             )
