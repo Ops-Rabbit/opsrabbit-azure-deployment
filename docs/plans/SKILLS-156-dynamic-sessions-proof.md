@@ -43,3 +43,15 @@ Microsoft reference sample reviewed at a76d4eb3dab30f9d02dcff6aa4063ba87343d9d5.
 ## Walkthrough retention
 
 The user explicitly requested on 2026-11-03 that the setup remain running after testing. Do not delete the environment, registry, identity or session pool. Individual sessions are ephemeral under the configured 300-second idle cooldown and can be recreated for the walkthrough. Retained infrastructure and one warm session can incur charges.
+
+## Completed feasibility proof
+
+The real OpenSandbox service on Container Apps now allocates custom-container
+Dynamic Sessions and proxies actual execd commands and files. All 33 live
+acceptance checks passed, along with 16 adapter tests and 26 existing Terraform
+tests. See [the execution report](../qa-runs/2026-11-03-SKILLS-156-opensandbox-end-to-end.md).
+
+The setup remains running for the walkthrough. Customer installer/bootstrap
+integration, durable controller recovery, full product-image validation and
+remaining High image findings are still open. PR #20 is a draft feasibility
+review; it has not been merged or approved as a production release.

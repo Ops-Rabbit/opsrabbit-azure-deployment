@@ -1,4 +1,5 @@
 # SKILLS-156 Azure Dynamic Sessions readiness test
+> Historical readiness snapshot. The later [OpenSandbox end-to-end report](2026-11-03-SKILLS-156-opensandbox-end-to-end.md) records the completed adapter proof.
 
 ## Outcome
 
