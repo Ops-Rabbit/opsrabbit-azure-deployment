@@ -1,0 +1,61 @@
+"""Run the genuine execd inside a restricted filesystem, including its file APIs.
+
+No cloud identity or controller credential is passed into this container.
+Failure to establish the namespace exits the container; there is no fallback.
+"""
+
+import os
+
+os.execvp(
+    "bwrap",
+    [
+        "bwrap",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent",
+        "--new-session",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--ro-bind",
+        "/opt/execd",
+        "/opt/execd",
+        "--bind",
+        "/workspace",
+        "/workspace",
+        "--tmpfs",
+        "/tmp",
+        "--dev",
+        "/dev",
+        "--chdir",
+        "/workspace",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        "/usr/bin:/bin",
+        "--setenv",
+        "LD_LIBRARY_PATH",
+        "/usr/local/lib",
+        "--setenv",
+        "HOME",
+        "/workspace",
+        "--",
+        "/opt/execd",
+        "--runtime-init",
+        "--port",
+        "8080",
+        "--log-level",
+        "3",
+    ],
+)

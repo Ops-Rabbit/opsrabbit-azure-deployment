@@ -1,0 +1,12 @@
+FROM docker.io/opensandbox/server:release-1.1.1@sha256:bcd5f264101262cebfa7e1ff9cd0424403e42f31a6596e4364cf90d8cb5c936b
+USER root
+RUN /usr/local/bin/python -m pip --python /app/.venv/bin/python install --no-cache-dir 'azure-identity==1.25.1' 'certifi==2026.10.23'
+RUN /usr/local/bin/python -m pip install --no-cache-dir 'setuptools==84.2.1'
+COPY patch-server.py /tmp/patch-server.py
+RUN python /tmp/patch-server.py
+COPY azure_service.py /app/opensandbox_server/services/azure_service.py
+COPY server-start.py /opt/server-start.py
+RUN python -m compileall -q /app/opensandbox_server
+USER 10001:10001
+ENTRYPOINT ["python", "/opt/server-start.py"]
+CMD []

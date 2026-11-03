@@ -1,0 +1,30 @@
+name: Azure OpenSandbox proof
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'spikes/dynamic-sessions/**'
+      - '.github/workflows/azure-sandbox-proof.yml'
+permissions:
+  contents: read
+jobs:
+  adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Lint proof code
+        run: |
+          python3 -m venv /tmp/proof-lint
+          /tmp/proof-lint/bin/pip install ruff==0.14.8
+          /tmp/proof-lint/bin/ruff check spikes/dynamic-sessions
+          /tmp/proof-lint/bin/ruff format --check spikes/dynamic-sessions
+      - name: Build pinned OpenSandbox server with Azure adapter
+        run: docker build -t opensandbox-azure-proof:ci -f spikes/dynamic-sessions/Dockerfile.server spikes/dynamic-sessions
+      - name: Adapter contract tests without network access
+        run: >-
+          docker run --rm --network none --entrypoint python
+          -v "$PWD/spikes/dynamic-sessions/test_azure_service.py:/tmp/test_azure_service.py:ro"
+          opensandbox-azure-proof:ci /tmp/test_azure_service.py
+      - name: Real upstream server startup and authentication
+        run: python3 spikes/dynamic-sessions/test-server-startup.py opensandbox-azure-proof:ci

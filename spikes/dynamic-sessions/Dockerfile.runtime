@@ -1,0 +1,11 @@
+# Minimal command/file runtime for the Azure feasibility proof, not the product image.
+FROM sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd@sha256:cda2bc35409bbf57561599b316cafb899598f7dce671332e7ceda14eb1cfeded AS execd
+FROM python:3.12-slim-trixie@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30
+RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -u 1000 -m sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace
+COPY --from=execd /execd /opt/execd
+COPY runtime-start.py /opt/runtime-start.py
+USER 1000:1000
+EXPOSE 8080
+CMD ["python", "/opt/runtime-start.py"]
