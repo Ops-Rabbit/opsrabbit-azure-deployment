@@ -1,11 +1,28 @@
 # Minimal command/file runtime for the Azure feasibility proof, not the product image.
-FROM sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd@sha256:cda2bc35409bbf57561599b316cafb899598f7dce671332e7ceda14eb1cfeded AS execd
+FROM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS execd
+RUN apt-get update && apt-get install -y --no-install-recommends patch && rm -rf /var/lib/apt/lists/*
+ADD https://codeload.github.com/opensandbox-group/OpenSandbox/tar.gz/b7d7697750b45be2ccc876da645c8880a0cf69fc /tmp/source.tar.gz
+RUN echo "1f221dc217be4da8a62a3f077e54fb6480e9f00adefaa4a74e5180a4f7cc8c73  /tmp/source.tar.gz" | sha256sum -c - \
+ && mkdir /src && tar -xzf /tmp/source.tar.gz -C /src --strip-components=1
+COPY execd-init-once.patch /tmp/
+WORKDIR /src
+RUN patch -p1 < /tmp/execd-init-once.patch
+COPY execd-init-once_test.go /src/components/execd/pkg/web/controller/opsrabbit_init_once_test.go
+WORKDIR /src/components/execd
+RUN gofmt -w main.go pkg/flag/flags.go pkg/flag/parser.go pkg/web/controller/init_runtime.go pkg/web/controller/opsrabbit_init_once_test.go \
+ && go get golang.org/x/net@v0.62.0 \
+ && go test -timeout 120s ./pkg/web/controller -run 'TestOneShot|TestApply' \
+ && CGO_ENABLED=0 go build -trimpath -ldflags "-X github.com/alibaba/opensandbox/internal/version.Version=skills156-init-once -X github.com/alibaba/opensandbox/internal/version.GitCommit=b7d7697750b45be2ccc876da645c8880a0cf69fc+opsrabbit-init-once -X github.com/alibaba/opensandbox/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o /execd .
 FROM python:3.12-slim-trixie@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30
-RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap ca-certificates \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends bubblewrap ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -u 1000 -m sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace
 COPY --from=execd /execd /opt/execd
-COPY runtime-start.py /opt/runtime-start.py
+COPY runtime-start.py runtime-gateway.py /opt/
+RUN mkdir -p /opt/opsrabbit-system/identity \
+ && touch /opt/opsrabbit-system/identity/passwd /opt/opsrabbit-system/identity/group \
+          /opt/opsrabbit-system/identity/shadow /opt/opsrabbit-system/identity/gshadow \
+ && chmod 0444 /opt/opsrabbit-system/identity/*
 USER 1000:1000
 EXPOSE 8080
-CMD ["python", "/opt/runtime-start.py"]
+CMD ["/usr/bin/env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin", "LD_LIBRARY_PATH=/usr/local/lib", "HOME=/workspace", "/usr/local/bin/python", "-I", "/opt/runtime-start.py"]

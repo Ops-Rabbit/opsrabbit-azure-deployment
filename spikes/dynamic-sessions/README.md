@@ -7,8 +7,9 @@ loopback bridge that adds Azure authentication and a per-session execd credentia
 upstream `execd` binary. There is no AKS cluster, VM, Docker daemon, or native
 Azure-only replacement for the OpenSandbox API.
 
-This directory is a bounded feasibility implementation. It does **not** change
-customer Terraform defaults or complete mandatory installer integration.
+This directory contains the Azure Dynamic Sessions adapter and installer
+integration for the customer deployment path. OpenSandbox is provisioned as
+part of an enabled application deployment; browser execution remains unsupported.
 
 ## Supported contract
 
@@ -16,7 +17,9 @@ customer Terraform defaults or complete mandatory installer integration.
 - Create, list, read, endpoint discovery with `use_server_proxy=true`, and delete.
 - Commands with stdout/stderr/exit status, file upload/download, command timeout
   and interruption. Requests and responses are bounded.
-- Two concurrent sessions, fixed 0.5 CPU/1Gi shape, explicit 60–300 second lifetime.
+- Configurable concurrent sessions, fixed 0.5 CPU/1Gi shape, explicit 60–3600
+  second maximum lifetime. Azure may delete an idle sandbox at the 3600-second
+  cooldown before its requested absolute expiry.
   Azure rejected a zero-ready-instance pool configuration in this subscription;
   this proof retains one ready instance and does not claim scale-to-zero cold-start
   acceptance.
@@ -74,6 +77,9 @@ docker run --rm --platform linux/amd64 --network none --entrypoint python \
 python3 spikes/dynamic-sessions/test-server-startup.py opensandbox-azure-proof:test
 ```
 
+The customer image publication helper also requires Skopeo; it scans the OCI
+layout before copying the image and attestations to ACR.
+
 CI runs the contract tests and real upstream startup/authentication checks without
 Azure credentials or provisioning cloud resources.
 
@@ -89,10 +95,10 @@ inventory. Never put credentials or customer-specific resource IDs in this repo.
 3. Create an image-pull identity and assign AcrPull at registry scope.
 4. Create a `Microsoft.App/sessionPools` custom-container Dynamic pool using the
    environment, runtime digest, port 8080, 0.5 CPU/1Gi, two maximum sessions, one
-   ready instance, 300-second timed idle cooldown, `EgressDisabled`, and image-pull
+   ready instance, 3600-second timed idle cooldown, `EgressDisabled`, and image-pull
    identity lifecycle `None`. ARM API `2025-07-01` was used to deploy it; API
    `2026-07-01` exposes template rollout and readiness details.
-5. Create a separate controller identity. Grant it Session Executor on this pool
+5. Create a separate controller identity. Grant it Azure ContainerApps Session Executor on this pool
    and AcrPull on the registry. Do not grant these permissions to sessions.
 6. Deploy the server digest as a single-replica Container App, with HTTPS-only
    port 8080 ingress and an IP allowlist for the test client. Inject a strong
@@ -118,27 +124,52 @@ and checks that later execution is rejected. If a check fails, consult the saved
 session inventory and retire those exact sessions through OpenSandbox, or allow
 bounded expiry. Do not delete the environment/pool to clean up a fixture.
 
-## Limits before customer installation
+## Durable controller recovery
 
-- Lifecycle state currently lives in SQLite inside one controller replica. On
-  controller replacement, unknown sessions fail closed but Azure's idle cooldown
-  may outlive their requested deadline. Durable state, recovery and a stronger
-  lease fence are required before production. Do not scale replicas above one.
+The controller stores its session journal in a dedicated PostgreSQL schema and
+uses a restricted role that can create and modify objects in that schema, but
+cannot create objects in `public`. SQLite remains only as a local development
+fallback. On startup the controller fences any interrupted allocation as
+retiring, confirms deletion with Azure, and revalidates each active session
+against the exact pool generation before serving requests. A PostgreSQL session
+advisory lock fences overlapping Container Apps revisions; only its holder may
+recover or mutate the journal. A new revision can start while the old one drains,
+but returns 503 until it acquires the lock and completes recovery. If Azure
+cannot confirm recovery, the controller stays unavailable and retries. It never
+replays a command or silently allocates a replacement session for an old
+identifier. Keep each deployment to one configured replica; the lock prevents
+overlapping writers, but this implementation does not provide multi-replica
+availability. The controller checks its lock-owning database connection; if
+PostgreSQL drops that connection, it exits so Container Apps restarts it and
+startup recovery reconciles the durable journal. Per-session locks preserve
+ordering for one sandbox while slow allocation and Azure calls leave unrelated
+sandbox requests available.
+
+The customer installer creates the schema and role, injects the connection
+string through the Container App secret mechanism, waits for the pool/controller
+to become ready, then invokes the product's verify-before-enable bootstrap from
+an init container. Existing administrator settings are preserved. Application
+startup is blocked if the real OpenSandbox command, file round-trip, or confirmed
+cleanup check fails.
+
+## Limits before customer release
 - Azure metadata-read plus dispatch is not atomic against external administrators.
   The runtime initialization gate and per-session credential prevent stale
   execution on replacement containers, but external interference may still cause
   a rejected request to allocate an idle replacement. Restrict executor access
-  to the controller and finish lifecycle recovery before production.
+  to the controller and keep each pool dedicated to this deployment.
 - Tenant authorization belongs to the trusted caller in this proof. It is not
   acceptance of OpsRabbit multi-tenant authorization or upstream tenant mode.
-- The minimal runtime, denied egress and fixed image cannot yet satisfy all
-  OpsRabbit tool workloads. Bootstrap/product UI, customer networking, renewals,
-  sustained concurrency, restart recovery and full installer tests are separate
-  acceptance gates.
-- Scans still report upstream/base-image High vulnerabilities. Record the exact
-  scan results; do not present an execution pass as a production security pass.
+- The minimal runtime, denied egress and fixed image cannot satisfy all
+  OpsRabbit tool workloads. Browser execution, renewals, sustained concurrency,
+  customer-network acceptance and multi-replica coordination remain unsupported.
+- Current pinned server and runtime images scan with zero Critical findings and
+  47 High findings each; Trivy reports no fixed versions for those High findings.
+  This is not image-security acceptance. Review the findings against an approved
+  risk policy or update the base/dependency versions before customer release.
 - Building this proof uses pinned top-level Python packages, but a full hashed
-  transitive dependency lock and release image pipeline remain necessary.
+  transitive dependency lock and a centrally managed release image pipeline
+  remain necessary.
 
 Keep this test setup running for the requested walkthrough. Individual sessions
 remain ephemeral. Warm capacity, Container Apps and retained registry storage can

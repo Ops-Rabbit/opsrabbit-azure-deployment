@@ -10,12 +10,22 @@ or use an existing customer-owned group.
 - Azure Files shares for application data and Git workspaces, restricted to the
   selected compute subnet in private mode
 - Azure Database for PostgreSQL Flexible Server 16
-- the PostgreSQL `vector` extension
+- the PostgreSQL `vector` extension and `pg_trgm` allowlist required by application migrations
 - either one Azure Container Instances group or one Azure Container App
   containing the ready-to-run OpsRabbit backend and web images
+- an Azure Container Apps custom-container Dynamic Sessions pool and a separate
+  OpenSandbox controller for every application installation, including ACI
+- a restricted PostgreSQL role and schema for durable OpenSandbox session
+  recovery, plus a fresh API key stored as an ACA secret and encrypted in the
+  OpsRabbit configuration store
 
-OpsRabbit builds the images and publishes them in OpsRabbit Amazon ECR. The
-customer does not build or modify images.
+OpsRabbit publishes its application images in its release registry. The two
+Azure OpenSandbox adapter images are built from this repository and pushed to
+the customer's ACR by the provided script.
+
+The first Azure integration confines both direct OpenSandbox command requests
+and file transfers to `/workspace`, including requests that bypass OpsRabbit.
+Browser automation is not supported by this Azure runtime yet.
 
 ## Security modes
 
@@ -56,6 +66,8 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
 | `variables.tf` | Required customer inputs and validation |
 | `main.tf` | Azure and PostgreSQL resources |
 | `container-apps.tf` | Azure Container Apps resources |
+| `opensandbox.tf` | Dynamic Sessions pool, isolated identities, controller and durable journal role |
+| `spikes/dynamic-sessions/` | Pinned Azure adapter/runtime images, contract tests and customer build helper |
 | `outputs.tf` | Deployment addresses and resource names |
 | `terraform.tfvars.example` | Secret-free customer input example |
 | `backend.tf.example` | Remote Azure state-backend example |
@@ -136,6 +148,20 @@ container_app_name             = "ca-opsrabbit"
 When `backend_image_repository` is omitted, Terraform selects
 `opsrabbit/backend-aci` for ACI and `opsrabbit/backend` for ACA.
 
+OpenSandbox always runs in Azure Container Apps because Dynamic Sessions is an
+ACA service. Terraform also creates a single-replica controller app with
+authenticated HTTPS ingress and a generated 64-character API key. In a private
+ACA environment, the environment's internal load balancer keeps the controller
+VNet-accessible to both private ACA and private ACI workloads without a public
+endpoint. In a public environment, the controller ingress is public and
+protected by the API key. Only the controller identity receives
+`Azure ContainerApps Session Executor` on the exact pool. The session pool
+denies egress and exposes no managed identity to workload containers.
+
+Before database migration or bootstrap, the init container checks that the
+selected backend image advertises verified-install contract version 1. It stops
+before changing application settings if the image is older or incompatible.
+
 ### Resource-group ownership
 
 The default creates and manages a dedicated resource group:
@@ -176,22 +202,23 @@ runner address. Azure Files and ACR retain authenticated public endpoints.
 ### Private networking
 
 Private mode disables public network access for the selected container platform,
-PostgreSQL, and ACR. It
+the OpenSandbox controller, PostgreSQL, and ACR. It
 creates an ACR private endpoint and restricts Azure Files to the ACI subnet
 through the Microsoft.Storage service endpoint required by ACI volume mounts.
 It uses customer-owned subnets and private DNS zones.
 
 The customer must prepare:
 
-- all three supplied subnets in the deployment subscription and Azure region
+- the selected compute subnet, PostgreSQL subnet, private-endpoint subnet, and
+  OpenSandbox ACA subnet in the deployment subscription and Azure region
 - an ACI-only subnet delegated to
   `Microsoft.ContainerInstance/containerGroups`
 - an operational NAT Gateway on the ACI subnet, with at least one public IP
   address or public IP prefix, for supported outbound connectivity
 - the `Microsoft.Storage` service endpoint enabled on the ACI subnet
-- when `deployment_target = "aca"`, a dedicated `/27` or larger infrastructure
-  subnet delegated to `Microsoft.App/environments`, supplied as
-  `container_apps_subnet_id` instead of `aci_subnet_id`
+- a dedicated `/27` or larger infrastructure subnet delegated to
+  `Microsoft.App/environments`, supplied as `container_apps_subnet_id`; for ACA
+  it is also the application subnet, while ACI needs this additional subnet
 - a PostgreSQL-only `/28` or larger subnet delegated to
   `Microsoft.DBforPostgreSQL/flexibleServers`
 - a separate subnet that allows the ACR private endpoint
@@ -441,13 +468,68 @@ Azure-services access; a network-restricted registry needs that exception for
 operations, so the Terraform runner must resolve and route to the ACR private
 endpoint even though it does not transfer image layers.
 
-## 6. Deploy the application
+## 6. Build and scan the Azure OpenSandbox images
+
+These images contain the Azure Dynamic Sessions adapter and the restricted
+workspace runtime. Build them from this checkout after the bootstrap apply:
+
+```bash
+chmod +x spikes/dynamic-sessions/build-azure-images.sh
+spikes/dynamic-sessions/build-azure-images.sh \
+  "$(terraform output -raw container_registry_name)" \
+  "<unique-build-tag>"
+```
+
+The helper attaches BuildKit SBOM and provenance attestations, pushes amd64
+images to the customer ACR, prints immutable digests for Terraform, scans both
+images with Trivy before publishing, and fails on Critical findings. Skopeo is
+required to publish the scanned OCI layouts with their attestations. Review every High finding;
+a passing Critical gate does not accept or remove High findings. The current
+proof images have zero Critical and 47 High findings each, with no fixed version
+reported. This remains a security acceptance gate for customer release; do not
+represent it as a clean scan or silently waive findings. Terraform state
+contains the generated OpenSandbox API key and restricted database password,
+so use encrypted remote state with limited access.
+
+Set the two printed digest values in `terraform.tfvars`:
+
+```hcl
+opensandbox_server_image_digest  = "sha256:<server-digest>"
+opensandbox_runtime_image_digest = "sha256:<runtime-digest>"
+```
+
+Keep image repositories and tags immutable. Never use a mutable `latest` tag
+in Terraform.
+
+## 7. Deploy the application
 
 Set the following value in `terraform.tfvars`:
 
 ```hcl
 application_enabled = true
 ```
+
+This apply creates the session pool, controller, dedicated identities and
+PostgreSQL journal schema. Before the OpsRabbit web/backend workload starts, an
+installer init container runs migrations and invokes the product's
+`--install` bootstrap. The product verifies command execution, file round-trip
+and confirmed cleanup through the real OpenSandbox path before saving the
+encrypted API key and enabling workspace-only command/file execution. If
+verification fails, the application container does not start. Existing active
+settings are preserved only when they match the deployed endpoint and image,
+use the required workspace-only/session policy, and pass verification with the
+saved encrypted key. Disabled or incompatible settings stop installation and
+require administrator reconciliation; the installer never overwrites them.
+
+Changes to the controller endpoint, server or runtime image digest, session
+limit, or generated credentials create new ACA revisions. The application
+revision reruns the installer bootstrap; the controller revision reloads its
+credentials. For ACI, a non-secret bootstrap revision fingerprint replaces the
+container group and reruns verification when the controller/runtime digest or
+session limit changes. During a single-revision controller rollout, the new
+process waits for the PostgreSQL leader lock before reconciling sessions.
+Requests can briefly return HTTP 503 while the old controller stops and the new
+one recovers the journal.
 
 Then review and apply:
 
@@ -458,7 +540,7 @@ terraform apply deployment.tfplan
 rm -f deployment.tfplan
 ```
 
-## 7. Verify the deployment
+## 8. Verify the deployment
 
 ```bash
 terraform output
@@ -522,9 +604,11 @@ Expected health response:
 ## Upgrades
 
 1. Receive the next approved release manifest and ECR access method.
-2. Import both new images into ACR by immutable digest.
+2. Import both application images into ACR by immutable digest.
 3. Verify the destination digests.
-4. Update only `backend_image_digest` and `web_image_digest`.
+4. Update `backend_image_digest` and `web_image_digest` for OpsRabbit releases;
+   update the OpenSandbox image digests only when a reviewed adapter/runtime
+   rebuild is intended.
 5. Review `terraform plan`.
 6. Apply and repeat the health and persistence checks.
 

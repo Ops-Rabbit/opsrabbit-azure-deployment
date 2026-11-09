@@ -19,6 +19,8 @@ variables {
   container_app_name                = "ca-opsrabbit-test"
   backend_image_digest              = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   web_image_digest                  = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  opensandbox_server_image_digest   = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  opensandbox_runtime_image_digest  = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   better_auth_secret                = join("", [for _ in range(32) : "a"])
   opsrabbit_encryption_key          = join("", [for _ in range(32) : "e"])
 }
@@ -72,8 +74,9 @@ override_resource {
   target          = azurerm_container_app_environment.opsrabbit[0]
   override_during = plan
   values = {
-    id             = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/managedEnvironments/cae-opsrabbit-test"
-    default_domain = "test.eastus2.azurecontainerapps.io"
+    id                = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/managedEnvironments/cae-opsrabbit-test"
+    default_domain    = "test.eastus2.azurecontainerapps.io"
+    static_ip_address = "10.20.0.5"
   }
 }
 
@@ -89,10 +92,28 @@ override_resource {
 }
 
 override_resource {
+  target          = azurerm_container_app.opensandbox[0]
+  override_during = plan
+  values = {
+    ingress = {
+      fqdn = "ca-opsrabbit-sandbox.test.eastus2.azurecontainerapps.io"
+    }
+  }
+}
+
+override_resource {
   target          = random_id.container_app_revision[0]
   override_during = plan
   values = {
     hex = "abcd1234"
+  }
+}
+
+override_resource {
+  target          = random_id.opensandbox_credential_revision[0]
+  override_during = plan
+  values = {
+    hex = "ef901234"
   }
 }
 
@@ -187,7 +208,13 @@ run "complete_public_aca_topology" {
   assert {
     condition = (
       azurerm_container_app.opsrabbit[0].template[0].revision_suffix != random_id.container_app_revision[0].hex &&
-      length(random_id.container_app_revision[0].keepers) == 1 &&
+      length(random_id.container_app_revision[0].keepers) == 2 &&
+      random_id.container_app_revision[0].keepers.opensandbox_bootstrap == sha512(jsonencode([
+        azurerm_container_app.opensandbox[0].ingress[0].fqdn,
+        var.opensandbox_server_image_digest,
+        var.opensandbox_runtime_image_digest,
+        var.opensandbox_max_sessions,
+      ])) &&
       length([
         for setting in azurerm_container_app.opsrabbit[0].template[0].container[0].env : setting
         if setting.name == "OPSRABBIT_SECRET_GENERATION" && setting.value == random_id.container_app_revision[0].hex
@@ -199,6 +226,29 @@ run "complete_public_aca_topology" {
   assert {
     condition     = length(azurerm_container_app.opsrabbit[0].template[0].container) == 2
     error_message = "The Container App must contain only the backend and web containers."
+  }
+
+  assert {
+    condition     = length(azurerm_container_app.opsrabbit[0].template[0].init_container) == 1 && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "initialize-opensandbox.js --install")
+    error_message = "Every fresh ACA deployment must verify and initialize OpenSandbox before the application starts."
+  }
+
+  assert {
+    condition     = strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "--capabilities") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "'{\"activation\":true,\"verification\":true,\"install\":true,\"contractVersion\":1}'")
+    error_message = "ACA bootstrap must reject backend images without the verified-install contract."
+  }
+
+  assert {
+    condition = length([
+      for setting in azurerm_container_app.opensandbox[0].template[0].container[0].env : setting
+      if setting.name == "OPENSANDBOX_CREDENTIAL_GENERATION" && setting.value == random_id.opensandbox_credential_revision[0].hex
+    ]) == 1
+    error_message = "ACA controller credential rotations must create a new revision."
+  }
+
+  assert {
+    condition     = azapi_resource.opensandbox_pool_image_pull[0].body.properties.sessionNetworkConfiguration.status == "EgressDisabled" && azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None" && azurerm_role_assignment.opensandbox_session_executor[0].role_definition_name == "Azure ContainerApps Session Executor" && azurerm_container_app.opensandbox[0].template[0].max_replicas == 1 && postgresql_schema.opensandbox[0].drop_cascade
+    error_message = "The ACA OpenSandbox topology must deny session egress, keep identity out of workloads, scope controller permissions and run one controller replica."
   }
 
   assert {
@@ -240,8 +290,16 @@ run "complete_public_aca_topology" {
 run "complete_private_aca_topology" {
   command = plan
 
+  override_resource {
+    target          = azurerm_private_dns_zone.opensandbox_environment[0]
+    override_during = plan
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.Network/privateDnsZones/test.eastus2.azurecontainerapps.io"
+    }
+  }
+
   override_data {
-    target = data.azapi_resource.container_apps_subnet["compute"]
+    target = data.azapi_resource.container_apps_subnet["sessions"]
     values = {
       output = {
         properties = {
@@ -267,6 +325,13 @@ run "complete_private_aca_topology" {
   }
 
   override_data {
+    target = data.azurerm_subnet.private["sessions"]
+    values = {
+      address_prefixes = ["10.20.0.0/27"]
+    }
+  }
+
+  override_data {
     target = data.azurerm_subnet.private["postgresql"]
     values = {
       address_prefixes = ["10.20.1.0/28"]
@@ -276,6 +341,14 @@ run "complete_private_aca_topology" {
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
     values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
+    values = {
+      id       = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer"
       location = "eastus2"
     }
   }
@@ -313,6 +386,36 @@ run "complete_private_aca_topology" {
   assert {
     condition     = azurerm_container_app_environment.opsrabbit[0].infrastructure_subnet_id == var.private_network.container_apps_subnet_id && azurerm_container_app_environment.opsrabbit[0].internal_load_balancer_enabled && azurerm_container_app_environment.opsrabbit[0].public_network_access == "Disabled"
     error_message = "Private ACA must use the supplied infrastructure subnet and an internal managed environment."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_zone.opensandbox_environment[0].name == azurerm_container_app_environment.opsrabbit[0].default_domain
+    error_message = "Private ACA DNS zone must use the managed environment's generated domain."
+  }
+
+  assert {
+    condition     = azurerm_container_app.opensandbox[0].ingress[0].external_enabled
+    error_message = "The OpenSandbox controller must be reachable from the internal ACA load balancer, including by private ACI."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_a_record.opensandbox_environment[0].name == "*"
+    error_message = "Private ACA DNS must use a wildcard A record."
+  }
+
+  assert {
+    condition     = length(azurerm_private_dns_a_record.opensandbox_environment[0].records) == 1 && contains(azurerm_private_dns_a_record.opensandbox_environment[0].records, azurerm_container_app_environment.opsrabbit[0].static_ip_address)
+    error_message = "Private ACA wildcard A record must point to the managed environment IP."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_a_record.opensandbox_environment[0].private_dns_zone_id == azurerm_private_dns_zone.opensandbox_environment[0].id && azurerm_private_dns_zone_virtual_network_link.opensandbox_environment[0].private_dns_zone_id == azurerm_private_dns_zone.opensandbox_environment[0].id
+    error_message = "Private ACA DNS records and VNet link must reference the managed environment zone."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_zone_virtual_network_link.opensandbox_environment[0].virtual_network_id == data.azurerm_virtual_network.private["sessions"].id
+    error_message = "Private ACA DNS zone must link to the customer VNet."
   }
 
   assert {
@@ -357,7 +460,18 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
   command = plan
 
   override_data {
-    target = data.azapi_resource.container_apps_subnet["compute"]
+    target = data.azurerm_subnet.private["compute"]
+    values = {
+      address_prefixes = ["10.20.0.0/27"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
+    }
+  }
+
+  override_data {
+    target = data.azapi_resource.container_apps_subnet["sessions"]
     values = {
       output = {
         properties = {
@@ -372,7 +486,7 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
   }
 
   override_data {
-    target = data.azurerm_subnet.private["compute"]
+    target = data.azurerm_subnet.private["sessions"]
     values = {
       address_prefixes = ["10.20.0.0/28"]
       service_endpoint = [{
@@ -391,6 +505,13 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
 
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
+    values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
     values = {
       location = "eastus2"
     }
@@ -433,7 +554,18 @@ run "reject_private_aca_subnet_without_delegation" {
   command = plan
 
   override_data {
-    target = data.azapi_resource.container_apps_subnet["compute"]
+    target = data.azurerm_subnet.private["compute"]
+    values = {
+      address_prefixes = ["10.20.0.0/27"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
+    }
+  }
+
+  override_data {
+    target = data.azapi_resource.container_apps_subnet["sessions"]
     values = {
       output = {
         properties = {
@@ -444,7 +576,7 @@ run "reject_private_aca_subnet_without_delegation" {
   }
 
   override_data {
-    target = data.azurerm_subnet.private["compute"]
+    target = data.azurerm_subnet.private["sessions"]
     values = {
       address_prefixes = ["10.20.0.0/27"]
       service_endpoint = [{
@@ -463,6 +595,13 @@ run "reject_private_aca_subnet_without_delegation" {
 
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
+    values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
     values = {
       location = "eastus2"
     }
@@ -523,5 +662,17 @@ run "reject_unknown_deployment_target" {
 
   expect_failures = [
     var.deployment_target,
+  ]
+}
+
+run "reject_fractional_opensandbox_session_limit" {
+  command = plan
+
+  variables {
+    opensandbox_max_sessions = 1.5
+  }
+
+  expect_failures = [
+    var.opensandbox_max_sessions,
   ]
 }

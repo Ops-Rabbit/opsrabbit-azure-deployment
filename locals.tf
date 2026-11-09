@@ -3,6 +3,8 @@ locals {
   application_enabled     = var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled
   aci_enabled             = local.application_enabled && var.deployment_target == "aci"
   container_app_enabled   = local.application_enabled && var.deployment_target == "aca"
+  opensandbox_enabled     = local.application_enabled
+  resource_group_id       = "/subscriptions/${var.subscription_id}/resourceGroups/${var.resource_group_name}"
 
   compute_subnet_id = local.private_network_enabled ? (
     var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null)
@@ -18,11 +20,12 @@ locals {
 
   private_subnet_ids = local.private_network_enabled && var.private_network != null ? {
     compute          = local.compute_subnet_id
+    sessions         = (var.deployment_target == "aca" || local.application_enabled) ? var.private_network.container_apps_subnet_id : null
     postgresql       = var.private_network.postgresql_subnet_id
     private_endpoint = var.private_network.private_endpoint_subnet_id
   } : {}
   private_subnet_parts = {
-    for name, id in local.private_subnet_ids : name => split("/", id)
+    for name, id in local.private_subnet_ids : name => split("/", id) if id != null
   }
 
   backend_image_repository = var.backend_image_repository != null ? var.backend_image_repository : (
@@ -34,4 +37,26 @@ locals {
   backend_healthcheck_command = "node -e \"fetch('http://127.0.0.1:8384/health').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))\""
 
   postgresql_database_url = "postgresql://${replace(urlencode(var.postgresql_administrator_login), "+", "%20")}:${replace(urlencode(var.postgresql_administrator_password), "+", "%20")}@${azurerm_postgresql_flexible_server.opsrabbit.fqdn}:5432/${replace(urlencode(var.postgresql_database_name), "+", "%20")}?sslmode=require"
+
+  opensandbox_database_url = local.opensandbox_enabled ? "postgresql://${urlencode(postgresql_role.opensandbox[0].name)}:${replace(urlencode(random_password.opensandbox_database[0].result), "+", "%20")}@${azurerm_postgresql_flexible_server.opsrabbit.fqdn}:5432/${replace(urlencode(var.postgresql_database_name), "+", "%20")}?sslmode=require" : null
+
+  opensandbox_bootstrap_json = local.opensandbox_enabled ? jsonencode({
+    endpoint = "https://${azurerm_container_app.opensandbox[0].ingress[0].fqdn}"
+    apiKey   = random_password.opensandbox_api_key[0].result
+    image    = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
+  }) : null
+
+  opensandbox_bootstrap_revision = local.opensandbox_enabled ? sha256(jsonencode({
+    server_digest  = var.opensandbox_server_image_digest
+    runtime_digest = var.opensandbox_runtime_image_digest
+    max_sessions   = var.opensandbox_max_sessions
+  })) : null
+
+  opensandbox_bootstrap_command = local.opensandbox_enabled ? join(" && ", [
+    "until nc -z \"$POSTGRES_HOST\" 5432; do sleep 2; done",
+    "set -o pipefail",
+    "node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --capabilities | grep -Fxq '{\"activation\":true,\"verification\":true,\"install\":true,\"contractVersion\":1}'",
+    "node /opt/opsrabbit/apps/backend/dist/scripts/db-migrate.js",
+    "printf '%s' \"$OPENSANDBOX_BOOTSTRAP_JSON\" | node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --install",
+  ]) : null
 }

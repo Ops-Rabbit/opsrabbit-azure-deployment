@@ -11,6 +11,20 @@ jobs:
   adapter:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16.10-bookworm
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: synthetic-ci-only
+          POSTGRES_DB: opensandbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d opensandbox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Lint proof code
@@ -26,5 +40,45 @@ jobs:
           docker run --rm --network none --entrypoint python
           -v "$PWD/spikes/dynamic-sessions/test_azure_service.py:/tmp/test_azure_service.py:ro"
           opensandbox-azure-proof:ci /tmp/test_azure_service.py
+      - name: PostgreSQL journal restart and least-privilege tests
+        run: >-
+          docker run --rm --network host --entrypoint python
+          -e AZURE_SESSION_TEST_ADMIN_URL=postgresql://postgres:synthetic-ci-only@127.0.0.1:5432/opensandbox_test
+          -v "$PWD/spikes/dynamic-sessions/test_postgres_recovery.py:/tmp/test_postgres_recovery.py:ro"
+          opensandbox-azure-proof:ci /tmp/test_postgres_recovery.py
       - name: Real upstream server startup and authentication
         run: python3 spikes/dynamic-sessions/test-server-startup.py opensandbox-azure-proof:ci
+      - name: Runtime worker startup and supervision tests
+        run: python3 -m unittest discover -s spikes/dynamic-sessions -p 'test_runtime_*.py' -v
+      - name: Build runtime and run one-shot initialization regressions
+        run: docker build -t opensandbox-azure-runtime:ci -f spikes/dynamic-sessions/Dockerfile.runtime spikes/dynamic-sessions
+      - name: Report server image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: opensandbox-azure-proof:ci
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+      - name: Block Critical server image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: opensandbox-azure-proof:ci
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+      - name: Verify direct command isolation and generated-file download
+        run: python3 spikes/dynamic-sessions/test-runtime-container.py opensandbox-azure-runtime:ci
+      - name: Report runtime image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: opensandbox-azure-runtime:ci
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+      - name: Block Critical runtime image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: opensandbox-azure-runtime:ci
+          format: table
+          severity: CRITICAL
+          exit-code: "1"

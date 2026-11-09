@@ -69,8 +69,8 @@ output "container_group_name" {
 }
 
 output "container_app_environment_name" {
-  description = "Azure Container Apps environment name, or null when ACA is not selected."
-  value       = var.deployment_target == "aca" ? azurerm_container_app_environment.opsrabbit[0].name : null
+  description = "Azure Container Apps environment hosting the workload or mandatory OpenSandbox service."
+  value       = var.deployment_target == "aca" || local.opensandbox_enabled ? azurerm_container_app_environment.opsrabbit[0].name : null
 }
 
 output "container_app_name" {
@@ -86,4 +86,14 @@ output "container_app_fqdn" {
 output "opsrabbit_url" {
   description = "OpsRabbit URL, or null until the selected application workload is enabled."
   value       = local.application_enabled ? local.application_origin : null
+}
+
+output "opensandbox_controller_endpoint" {
+  description = "Authenticated OpenSandbox lifecycle endpoint used by the installer-configured OpsRabbit backend."
+  value       = local.opensandbox_enabled ? "https://${azurerm_container_app.opensandbox[0].ingress[0].fqdn}" : null
+}
+
+output "opensandbox_session_pool_endpoint" {
+  description = "Azure Dynamic Sessions management endpoint used privately by the OpenSandbox controller."
+  value       = local.opensandbox_enabled ? azapi_resource.opensandbox_pool_image_pull[0].output.properties.poolManagementEndpoint : null
 }

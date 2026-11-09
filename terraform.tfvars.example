@@ -42,9 +42,14 @@ container_app_name             = "ca-opsrabbit"
 backend_image_digest     = "sha256:<backend-digest-from-release-manifest>"
 web_image_repository     = "opsrabbit/web"
 web_image_digest         = "sha256:<web-digest-from-release-manifest>"
+opensandbox_server_image_digest  = "sha256:<server-digest-from-local-build>"
+opensandbox_runtime_image_digest = "sha256:<runtime-digest-from-local-build>"
+opensandbox_max_sessions          = 2
 
-# Keep false for the bootstrap apply. Set true only after both images have been
-# imported into the customer ACR and their digests have been verified.
+# Keep false for the bootstrap apply. Before setting true, import the OpsRabbit
+# release images and build/push the two OpenSandbox images using
+# spikes/dynamic-sessions/build-azure-images.sh. Set all four image digests only
+# after verifying the destination digests in this customer's ACR.
 application_enabled = false
 
 tags = {

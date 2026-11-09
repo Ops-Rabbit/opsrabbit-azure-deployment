@@ -37,8 +37,8 @@ data "azurerm_virtual_network" "private" {
 }
 
 data "azapi_resource" "container_apps_subnet" {
-  for_each = local.private_network_enabled && var.deployment_target == "aca" && local.compute_subnet_id != null ? {
-    compute = local.compute_subnet_id
+  for_each = local.private_network_enabled && (var.deployment_target == "aca" || local.opensandbox_enabled) && try(var.private_network.container_apps_subnet_id, null) != null ? {
+    sessions = var.private_network.container_apps_subnet_id
   } : {}
 
   type                   = "Microsoft.Network/virtualNetworks/subnets@2024-05-01"
@@ -114,6 +114,7 @@ resource "azurerm_role_assignment" "acr_pull" {
   skip_service_principal_aad_check = true
 }
 
+# nosemgrep: terraform.azure.security.storage.storage-queue-services-logging.storage-queue-services-logging -- This account is used only for Azure Files shares; Queue service is not provisioned or used.
 resource "azurerm_storage_account" "opsrabbit" {
   name                = var.storage_account_name
   resource_group_name = var.resource_group_name
@@ -223,7 +224,7 @@ resource "azurerm_postgresql_flexible_server_database" "opsrabbit" {
 resource "azurerm_postgresql_flexible_server_configuration" "extensions" {
   name      = "azure.extensions"
   server_id = azurerm_postgresql_flexible_server.opsrabbit.id
-  value     = "VECTOR"
+  value     = "VECTOR,PG_TRGM"
 }
 
 resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
@@ -330,6 +331,29 @@ resource "azurerm_container_group" "opsrabbit" {
   image_registry_credential {
     server                    = azurerm_container_registry.opsrabbit.login_server
     user_assigned_identity_id = azurerm_user_assigned_identity.aci_pull.id
+  }
+
+  dynamic "init_container" {
+    for_each = local.opensandbox_enabled ? [1] : []
+    content {
+      name  = "sandbox-bootstrap"
+      image = local.backend_image
+      commands = [
+        "/bin/bash",
+        "-lc",
+        local.opensandbox_bootstrap_command,
+      ]
+      environment_variables = {
+        NODE_ENV                       = "production"
+        POSTGRES_HOST                  = azurerm_postgresql_flexible_server.opsrabbit.fqdn
+        OPENSANDBOX_BOOTSTRAP_REVISION = local.opensandbox_bootstrap_revision
+      }
+      secure_environment_variables = {
+        OPSRABBIT_NODE_DATABASE_URL   = local.postgresql_database_url
+        OPSRABBIT_NODE_ENCRYPTION_KEY = var.opsrabbit_encryption_key
+        OPENSANDBOX_BOOTSTRAP_JSON    = local.opensandbox_bootstrap_json
+      }
+    }
   }
 
   container {
@@ -462,6 +486,7 @@ resource "azurerm_container_group" "opsrabbit" {
 
   depends_on = [
     azurerm_role_assignment.acr_pull,
+    azurerm_container_app.opensandbox,
     azurerm_postgresql_flexible_server_firewall_rule.azure_services,
     azurerm_private_endpoint.container_registry,
     postgresql_extension.vector,
