@@ -2,6 +2,7 @@ mock_provider "azurerm" {}
 mock_provider "azapi" {}
 mock_provider "postgresql" {}
 mock_provider "random" {}
+mock_provider "time" {}
 
 variables {
   subscription_id                   = "00000000-0000-0000-0000-000000000001"
@@ -92,12 +93,40 @@ override_resource {
 }
 
 override_resource {
-  target          = azurerm_container_app.opensandbox[0]
+  target          = azapi_resource.opensandbox[0]
   override_during = plan
   values = {
+    id = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/containerApps/ca-opensandbox"
     ingress = {
       fqdn = "ca-opsrabbit-sandbox.test.eastus2.azurecontainerapps.io"
     }
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox"
+    principal_id = "00000000-0000-0000-0000-000000000010"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_server_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox-server-pull"
+    principal_id = "00000000-0000-0000-0000-000000000011"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_runtime_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox-runtime-pull"
+    principal_id = "00000000-0000-0000-0000-000000000012"
   }
 }
 
@@ -210,7 +239,7 @@ run "complete_public_aca_topology" {
       azurerm_container_app.opsrabbit[0].template[0].revision_suffix != random_id.container_app_revision[0].hex &&
       length(random_id.container_app_revision[0].keepers) == 2 &&
       random_id.container_app_revision[0].keepers.opensandbox_bootstrap == sha512(jsonencode([
-        azurerm_container_app.opensandbox[0].ingress[0].fqdn,
+        local.opensandbox_controller_origin,
         var.opensandbox_server_image_digest,
         var.opensandbox_runtime_image_digest,
         var.opensandbox_max_sessions,
@@ -240,15 +269,53 @@ run "complete_public_aca_topology" {
 
   assert {
     condition = length([
-      for setting in azurerm_container_app.opensandbox[0].template[0].container[0].env : setting
+      for setting in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : setting
       if setting.name == "OPENSANDBOX_CREDENTIAL_GENERATION" && setting.value == random_id.opensandbox_credential_revision[0].hex
     ]) == 1
     error_message = "ACA controller credential rotations must create a new revision."
   }
 
   assert {
-    condition     = azapi_resource.opensandbox_pool_image_pull[0].body.properties.sessionNetworkConfiguration.status == "EgressDisabled" && azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None" && azurerm_role_assignment.opensandbox_session_executor[0].role_definition_name == "Azure ContainerApps Session Executor" && azurerm_container_app.opensandbox[0].template[0].max_replicas == 1 && postgresql_schema.opensandbox[0].drop_cascade
+    condition     = azapi_resource.opensandbox_pool_image_pull[0].body.properties.sessionNetworkConfiguration.status == "EgressDisabled" && azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None" && azurerm_role_assignment.opensandbox_session_executor[0].role_definition_name == "Azure ContainerApps Session Executor" && azapi_resource.opensandbox[0].body.properties.template.scale.maxReplicas == 1 && postgresql_schema.opensandbox[0].drop_cascade
     error_message = "The ACA OpenSandbox topology must deny session egress, keep identity out of workloads, scope controller permissions and run one controller replica."
+  }
+
+  assert {
+    condition = (
+      azapi_update_resource.acr_repository_mode.body.properties.roleAssignmentMode == "AbacRepositoryPermissions" &&
+      azurerm_role_assignment.acr_pull.role_definition_name == "AcrPull" &&
+      azurerm_role_assignment.acr_repository_reader.role_definition_name == "Container Registry Repository Reader" &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "registries/repositories:name") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/backend") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/web") &&
+      time_sleep.acr_role_propagation.create_duration == "5m" &&
+      time_sleep.acr_role_propagation.triggers.opensandbox_runtime_acl == local.acr_opensandbox_runtime_reader_condition
+    )
+    error_message = "ACR must retain legacy pull access until it has switched after assigning repository-scoped reader access."
+  }
+
+  assert {
+    condition = (
+      azurerm_role_assignment.opensandbox_acr_pull[0].principal_id == azurerm_user_assigned_identity.opensandbox_server_pull[0].principal_id &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].principal_id == azurerm_user_assigned_identity.opensandbox_runtime_pull[0].principal_id &&
+      azurerm_role_assignment.opensandbox_session_executor[0].principal_id == azurerm_user_assigned_identity.opensandbox[0].principal_id &&
+      azurerm_user_assigned_identity.opensandbox[0].principal_id != azurerm_user_assigned_identity.opensandbox_server_pull[0].principal_id &&
+      azurerm_user_assigned_identity.opensandbox[0].principal_id != azurerm_user_assigned_identity.opensandbox_runtime_pull[0].principal_id
+    )
+    error_message = "The controller executor, server image pull, and runtime image pull must use separate identities."
+  }
+
+  assert {
+    condition = (
+      contains(azapi_resource.opensandbox[0].identity[0].identity_ids, azurerm_user_assigned_identity.opensandbox[0].id) &&
+      contains(azapi_resource.opensandbox[0].identity[0].identity_ids, azurerm_user_assigned_identity.opensandbox_server_pull[0].id) &&
+      azapi_resource.opensandbox[0].body.properties.configuration.registries[0].identity == azurerm_user_assigned_identity.opensandbox_server_pull[0].id &&
+      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].identity == azurerm_user_assigned_identity.opensandbox[0].id &&
+      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].identity == azurerm_user_assigned_identity.opensandbox_server_pull[0].id &&
+      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].lifecycle == "Main" &&
+      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].lifecycle == "None"
+    )
+    error_message = "The controller must use its executor identity at runtime while the server image-pull identity is unavailable to app code."
   }
 
   assert {
@@ -394,7 +461,7 @@ run "complete_private_aca_topology" {
   }
 
   assert {
-    condition     = azurerm_container_app.opensandbox[0].ingress[0].external_enabled
+    condition     = azapi_resource.opensandbox[0].body.properties.configuration.ingress.external
     error_message = "The OpenSandbox controller must be reachable from the internal ACA load balancer, including by private ACI."
   }
 
@@ -674,5 +741,29 @@ run "reject_fractional_opensandbox_session_limit" {
 
   expect_failures = [
     var.opensandbox_max_sessions,
+  ]
+}
+
+run "reject_invalid_opensandbox_controller_name" {
+  command = plan
+
+  variables {
+    opensandbox_controller_name = "ca--opensandbox"
+  }
+
+  expect_failures = [
+    var.opensandbox_controller_name,
+  ]
+}
+
+run "reject_invalid_container_app_name" {
+  command = plan
+
+  variables {
+    container_app_name = "ca--opsrabbit"
+  }
+
+  expect_failures = [
+    var.container_app_name,
   ]
 }

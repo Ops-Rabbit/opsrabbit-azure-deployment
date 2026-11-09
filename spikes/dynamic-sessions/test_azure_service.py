@@ -479,7 +479,10 @@ class AdapterTests(unittest.TestCase):
 
     def test_renewal_preserves_session_and_updates_deadline(self):
         sid = self.service._create(self.request()).id
-        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+        created_at = datetime.fromisoformat(
+            json.loads(self.service._row(sid)[0])["createdAt"]
+        )
+        expiry = created_at + timedelta(minutes=30)
         response = self.service.renew_expiration(
             sid, SimpleNamespace(expires_at=expiry)
         )
@@ -511,6 +514,19 @@ class AdapterTests(unittest.TestCase):
                 SimpleNamespace(
                     expires_at=datetime.now(timezone.utc) + timedelta(hours=2)
                 ),
+            ),
+        )
+
+    def test_renewal_cannot_extend_past_absolute_session_lifetime(self):
+        sid = self.service._create(self.request()).id
+        created_at = datetime.fromisoformat(
+            json.loads(self.service._row(sid)[0])["createdAt"]
+        )
+        self.assertRejected(
+            400,
+            lambda: self.service.renew_expiration(
+                sid,
+                SimpleNamespace(expires_at=created_at + timedelta(hours=1, seconds=1)),
             ),
         )
 

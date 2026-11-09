@@ -6,7 +6,7 @@ or use an existing customer-owned group.
 
 - Azure Container Registry, using Basic for public mode or Premium with a
   private endpoint for private mode
-- user-assigned image-pull identity and `AcrPull` permission
+- separate controller and image-pull identities with repository-scoped ACR Reader roles
 - Azure Files shares for application data and Git workspaces, restricted to the
   selected compute subnet in private mode
 - Azure Database for PostgreSQL Flexible Server 16
@@ -66,7 +66,7 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
 | `variables.tf` | Required customer inputs and validation |
 | `main.tf` | Azure and PostgreSQL resources |
 | `container-apps.tf` | Azure Container Apps resources |
-| `opensandbox.tf` | Dynamic Sessions pool, isolated identities, controller and durable journal role |
+| `opensandbox.tf` | Dynamic Sessions pool, separate executor and image-pull identities, controller and durable journal role |
 | `spikes/dynamic-sessions/` | Pinned Azure adapter/runtime images, contract tests and customer build helper |
 | `outputs.tf` | Deployment addresses and resource names |
 | `terraform.tfvars.example` | Secret-free customer input example |
@@ -76,7 +76,7 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
 
 - Azure subscription
 - permission to create resources, register the listed Azure providers, and
-  create the ACR role assignment
+  create conditional ACR role assignments
 - when customer-owned network resources are supplied, permission to read the
   three virtual networks and subnets, join each subnet, and attach the ACR
   private endpoint to the supplied private DNS zone
@@ -154,9 +154,25 @@ authenticated HTTPS ingress and a generated 64-character API key. In a private
 ACA environment, the environment's internal load balancer keeps the controller
 VNet-accessible to both private ACA and private ACI workloads without a public
 endpoint. In a public environment, the controller ingress is public and
-protected by the API key. Only the controller identity receives
-`Azure ContainerApps Session Executor` on the exact pool. The session pool
-denies egress and exposes no managed identity to workload containers.
+protected by the API key. The controller's execution identity receives only
+`Azure ContainerApps Session Executor` on the exact pool. Separate identities
+pull the OpenSandbox server and runtime images, each with read access to its
+single repository. Their identity tokens are unavailable to the controller
+process and sandbox workload. The session pool denies egress and exposes no
+managed identity to workload containers.
+
+Terraform enables ACR's RBAC plus ABAC repository mode after it assigns the
+installer identities' repository-scoped Reader roles. Legacy `AcrPull`,
+`AcrPush`, and `AcrDelete` assignments stop granting data access in that mode.
+For an existing customer-managed registry, migrate any external identity roles
+before changing the mode. Azure's [ACR ABAC migration guidance](https://learn.microsoft.com/azure/container-registry/container-registry-rbac-abac-repository-permissions)
+describes the impact. ACR authorization changes can also require fresh
+credentials; refresh cached credentials **after** the mode switch has
+completed. Terraform waits five minutes after creating or changing the grants
+before switching ACR authorization mode and starting image pulls, so the
+assignments can propagate to the registry data plane. The legacy `AcrPull`
+assignment remains managed for upgrade continuity; ACR ignores that role after
+the switch, while the repository-conditioned Reader grants provide data access.
 
 Before database migration or bootstrap, the init container checks that the
 selected backend image advertises verified-install contract version 1. It stops
@@ -404,8 +420,12 @@ a public address.
 
 ## 5. Import the finished images from OpsRabbit ECR
 
-The customer runs these commands using the short-lived ECR token supplied by
-OpsRabbit. The customer does not need an AWS account or AWS CLI.
+The operator running the import needs the Azure role `Container Registry Data
+Importer and Data Reader` on the customer ACR. Grant it only for the import,
+then remove it after both images are verified. The role is registry-wide; it is
+not assigned to any application or sandbox identity. The customer runs these
+commands using the short-lived ECR token supplied by OpsRabbit. The customer
+does not need an AWS account or AWS CLI.
 
 Set values from the release manifest:
 
@@ -485,11 +505,19 @@ images to the customer ACR, prints immutable digests for Terraform, scans both
 images with Trivy before publishing, and fails on Critical findings. Skopeo is
 required to publish the scanned OCI layouts with their attestations. Review every High finding;
 a passing Critical gate does not accept or remove High findings. The current
-proof images have zero Critical and 47 High findings each, with no fixed version
-reported. This remains a security acceptance gate for customer release; do not
+latest server scan reported zero Critical and 47 High findings. The current
+runtime image scan is pending. This remains a security acceptance gate for
+customer release; do not
 represent it as a clean scan or silently waive findings. Terraform state
 contains the generated OpenSandbox API key and restricted database password,
 so use encrypted remote state with limited access.
+
+The operator building/publishing these images also needs `Container Registry
+Repository Writer` on the ACR, conditioned separately to
+`opsrabbit/opensandbox-server` and `opsrabbit/opensandbox-runtime`. Do not grant
+this write role to either runtime identity. The installer gives the deployed
+server and session pool only repository-scoped Reader access after their image
+digests are configured.
 
 Set the two printed digest values in `terraform.tfvars`:
 

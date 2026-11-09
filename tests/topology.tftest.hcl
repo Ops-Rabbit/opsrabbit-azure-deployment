@@ -1,5 +1,7 @@
 mock_provider "azurerm" {}
 mock_provider "postgresql" {}
+mock_provider "azapi" {}
+mock_provider "time" {}
 
 variables {
   subscription_id                   = "00000000-0000-0000-0000-000000000001"
@@ -45,6 +47,33 @@ override_resource {
     id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test"
     client_id    = "00000000-0000-0000-0000-000000000003"
     principal_id = "00000000-0000-0000-0000-000000000002"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test-sandbox"
+    principal_id = "00000000-0000-0000-0000-000000000010"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_server_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test-sandbox-server-pull"
+    principal_id = "00000000-0000-0000-0000-000000000011"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_runtime_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test-sandbox-runtime-pull"
+    principal_id = "00000000-0000-0000-0000-000000000012"
   }
 }
 
@@ -177,6 +206,21 @@ run "complete_application_topology" {
   assert {
     condition     = azapi_resource.opensandbox_pool_image_pull[0].body.properties.sessionNetworkConfiguration.status == "EgressDisabled" && azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None" && azurerm_role_assignment.opensandbox_session_executor[0].role_definition_name == "Azure ContainerApps Session Executor" && postgresql_schema.opensandbox[0].drop_cascade
     error_message = "The fixed session pool must deny egress, withhold runtime identity and scope Session Executor to this pool."
+  }
+
+  assert {
+    condition = (
+      azapi_update_resource.acr_repository_mode.body.properties.roleAssignmentMode == "AbacRepositoryPermissions" &&
+      azurerm_role_assignment.acr_pull.role_definition_name == "AcrPull" &&
+      azurerm_role_assignment.acr_repository_reader.role_definition_name == "Container Registry Repository Reader" &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "registries/repositories:name") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/backend-aci") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/web") &&
+      time_sleep.acr_role_propagation.create_duration == "5m" &&
+      time_sleep.acr_role_propagation.triggers.opensandbox_server_acl == local.acr_opensandbox_server_reader_condition &&
+      azurerm_role_assignment.opensandbox_session_executor[0].principal_id != azurerm_role_assignment.opensandbox_acr_pull[0].principal_id
+    )
+    error_message = "ACI image access must keep pull access during the ABAC transition and scope the new identity grant to its repositories."
   }
 
   assert {
@@ -390,7 +434,7 @@ run "private_application_topology" {
   }
 
   assert {
-    condition     = azurerm_container_app.opensandbox[0].ingress[0].external_enabled
+    condition     = azapi_resource.opensandbox[0].body.properties.configuration.ingress.external
     error_message = "Private ACI must reach OpenSandbox through the internal ACA environment load balancer."
   }
 

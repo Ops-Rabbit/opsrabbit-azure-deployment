@@ -215,7 +215,7 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 return False
             try:
                 # Serialize the controller's schema migrations as well as
-                # journal recovery during revision overlap.
+                # the journal transition before recovery.
                 self._initialize_postgres_schema()
                 # Retire allocations interrupted by a prior controller; never
                 # replay their user command.
@@ -223,9 +223,6 @@ class AzureSandboxService(SandboxService, ExtensionService):
                     "UPDATE sessions SET state='retiring' WHERE state='allocating'"
                 )
                 self.db.commit()
-                self._recover()
-                self.leader_ready = True
-                return True
             except Exception:
                 self.db.rollback()
                 self.db.execute(
@@ -233,6 +230,22 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 )
                 self.db.commit()
                 raise
+        try:
+            # Recovery takes session locks and then briefly takes self.lock for
+            # journal access, matching the request path's lock order. Keep the
+            # advisory database lock, but release self.lock during Azure I/O.
+            self._recover()
+        except Exception:
+            with self.lock:
+                self.db.rollback()
+                self.db.execute(
+                    "SELECT pg_advisory_unlock(%s, %s)", self.leadership_lock_key
+                )
+                self.db.commit()
+            raise
+        with self.lock:
+            self.leader_ready = True
+        return True
 
     def _leadership_loop(self):
         while not self.shutdown.wait(1):
@@ -744,9 +757,12 @@ class AzureSandboxService(SandboxService, ExtensionService):
             self._require_leader()
             row = self._live(sandbox_id)
             now = time.time()
-            if not now < deadline <= now + MAX_LEASE:
-                fail(400, "Expiration must be in the next 7 days")
             data = json.loads(row[0])
+            created_at = datetime.fromisoformat(
+                data["createdAt"].replace("Z", "+00:00")
+            ).timestamp()
+            if not now < deadline <= created_at + MAX_LEASE:
+                fail(400, "Expiration must be within one hour of session creation")
             data["expiresAt"] = request.expires_at.isoformat()
             with self.lock:
                 self._require_leader()

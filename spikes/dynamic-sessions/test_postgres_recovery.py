@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -197,6 +198,85 @@ class PostgresRecoveryTests(unittest.TestCase):
             self.assertTrue(follower.leader_ready)
         finally:
             follower.close()
+
+    def test_startup_recovery_does_not_block_requests_on_inverted_lock_order(self):
+        service = self.service()
+        with psycopg.connect(self.database_url) as db:
+            db.execute(
+                "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token,secure_token,caller_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    "active-session",
+                    json.dumps(
+                        {
+                            "id": "active-session",
+                            "image": {
+                                "uri": "example.invalid/runtime@sha256:" + "a" * 64
+                            },
+                        }
+                    ),
+                    4_102_444_800,
+                    "active",
+                    "2026-11-09T00:00:00Z",
+                    "synthetic-token",
+                    "",
+                    0,
+                ),
+            )
+        # Simulate a new controller acquiring leadership after a revision
+        # handover. The constructor's initial recovery has already completed.
+        service.db.execute(
+            "SELECT pg_advisory_unlock(%s, %s)", service.leadership_lock_key
+        )
+        service.db.commit()
+        recovery_entered = threading.Event()
+        allow_recovery = threading.Event()
+        request_finished = threading.Event()
+        request_status = []
+        recovery_result = []
+        original_recover = service._recover
+
+        def pause_recovery():
+            recovery_entered.set()
+            if not allow_recovery.wait(3):
+                raise TimeoutError("Test did not release startup recovery")
+            original_recover()
+
+        def recover():
+            try:
+                recovery_result.append(service._try_become_leader())
+            except Exception as exc:
+                recovery_result.append(exc)
+
+        def request_session():
+            try:
+                service._live("active-session")
+            except HTTPException as exc:
+                request_status.append(exc.status_code)
+            finally:
+                request_finished.set()
+
+        service.leader_ready = False
+        try:
+            with patch.object(service, "_recover", side_effect=pause_recovery):
+                recovery_thread = threading.Thread(target=recover)
+                recovery_thread.start()
+                self.assertTrue(recovery_entered.wait(2))
+                request_thread = threading.Thread(target=request_session)
+                request_thread.start()
+                self.assertTrue(
+                    request_finished.wait(1),
+                    "A request hung while startup recovery held the journal lock",
+                )
+                self.assertEqual(request_status, [503])
+                allow_recovery.set()
+                recovery_thread.join(3)
+                request_thread.join(3)
+            self.assertFalse(recovery_thread.is_alive())
+            self.assertEqual(recovery_result, [True])
+            self.assertTrue(service.leader_ready)
+        finally:
+            allow_recovery.set()
+            service.close()
 
     def test_lost_leadership_connection_terminates_for_aca_restart(self):
         service = self.service()

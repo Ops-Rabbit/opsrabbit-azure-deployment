@@ -108,7 +108,7 @@ resource "random_id" "container_app_revision" {
       try(random_password.opensandbox_database[0].result, null),
     ]))
     opensandbox_bootstrap = local.opensandbox_enabled ? sha512(jsonencode([
-      azurerm_container_app.opensandbox[0].ingress[0].fqdn,
+      local.opensandbox_controller_origin,
       var.opensandbox_server_image_digest,
       var.opensandbox_runtime_image_digest,
       var.opensandbox_max_sessions,
@@ -175,32 +175,35 @@ resource "azurerm_container_app" "opsrabbit" {
     max_replicas                     = 1
     termination_grace_period_seconds = 120
 
-    init_container {
-      name    = "sandbox-bootstrap"
-      image   = local.backend_image
-      cpu     = 0.5
-      memory  = "1Gi"
-      command = ["/bin/bash", "-lc"]
-      args    = [local.opensandbox_bootstrap_command]
-      env {
-        name  = "POSTGRES_HOST"
-        value = azurerm_postgresql_flexible_server.opsrabbit.fqdn
-      }
-      env {
-        name        = "OPSRABBIT_NODE_DATABASE_URL"
-        secret_name = "database-url"
-      }
-      env {
-        name        = "OPENSANDBOX_BOOTSTRAP_JSON"
-        secret_name = "opensandbox-bootstrap-json"
-      }
-      env {
-        name        = "OPSRABBIT_NODE_ENCRYPTION_KEY"
-        secret_name = "opsrabbit-encryption-key"
-      }
-      env {
-        name  = "NODE_ENV"
-        value = "production"
+    dynamic "init_container" {
+      for_each = local.opensandbox_enabled ? [1] : []
+      content {
+        name    = "sandbox-bootstrap"
+        image   = local.backend_image
+        cpu     = 0.5
+        memory  = "1Gi"
+        command = ["/bin/bash", "-lc"]
+        args    = [local.opensandbox_bootstrap_command]
+        env {
+          name  = "POSTGRES_HOST"
+          value = azurerm_postgresql_flexible_server.opsrabbit.fqdn
+        }
+        env {
+          name        = "OPSRABBIT_NODE_DATABASE_URL"
+          secret_name = "database-url"
+        }
+        env {
+          name        = "OPENSANDBOX_BOOTSTRAP_JSON"
+          secret_name = "opensandbox-bootstrap-json"
+        }
+        env {
+          name        = "OPSRABBIT_NODE_ENCRYPTION_KEY"
+          secret_name = "opsrabbit-encryption-key"
+        }
+        env {
+          name  = "NODE_ENV"
+          value = "production"
+        }
       }
     }
 
@@ -404,7 +407,10 @@ resource "azurerm_container_app" "opsrabbit" {
 
   depends_on = [
     azurerm_role_assignment.acr_pull,
-    azurerm_container_app.opensandbox,
+    azurerm_role_assignment.acr_repository_reader,
+    time_sleep.acr_role_propagation,
+    azapi_update_resource.acr_repository_mode,
+    azapi_resource.opensandbox,
     azurerm_postgresql_flexible_server_firewall_rule.azure_services,
     azurerm_private_endpoint.container_registry,
     azurerm_container_app_environment_storage.application_data,

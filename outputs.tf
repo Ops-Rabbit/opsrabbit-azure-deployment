@@ -90,7 +90,7 @@ output "opsrabbit_url" {
 
 output "opensandbox_controller_endpoint" {
   description = "Authenticated OpenSandbox lifecycle endpoint used by the installer-configured OpsRabbit backend."
-  value       = local.opensandbox_enabled ? "https://${azurerm_container_app.opensandbox[0].ingress[0].fqdn}" : null
+  value       = local.opensandbox_controller_origin
 }
 
 output "opensandbox_session_pool_endpoint" {

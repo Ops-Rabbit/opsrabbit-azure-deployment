@@ -15,6 +15,10 @@ locals {
     "https://${var.container_app_name}.${azurerm_container_app_environment.opsrabbit[0].default_domain}",
     null,
   ) : null
+  opensandbox_controller_origin = local.opensandbox_enabled ? try(
+    "https://${var.opensandbox_controller_name}.${azurerm_container_app_environment.opsrabbit[0].default_domain}",
+    null,
+  ) : null
   public_origin      = var.deployment_target == "aca" ? local.container_app_public_origin : local.aci_public_origin
   application_origin = local.private_network_enabled ? try(var.private_network.application_origin, null) : local.public_origin
 
@@ -31,8 +35,12 @@ locals {
   backend_image_repository = var.backend_image_repository != null ? var.backend_image_repository : (
     var.deployment_target == "aca" ? "opsrabbit/backend" : "opsrabbit/backend-aci"
   )
-  backend_image = "${azurerm_container_registry.opsrabbit.login_server}/${local.backend_image_repository}@${var.backend_image_digest}"
-  web_image     = "${azurerm_container_registry.opsrabbit.login_server}/${var.web_image_repository}@${var.web_image_digest}"
+  acr_repository_reader_action_guard       = "(!(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/content/read'}) AND !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/metadata/read'}))"
+  acr_application_reader_condition         = "(${local.acr_repository_reader_action_guard} OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '${local.backend_image_repository}' OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '${var.web_image_repository}'))"
+  acr_opensandbox_server_reader_condition  = "(${local.acr_repository_reader_action_guard} OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase 'opsrabbit/opensandbox-server')"
+  acr_opensandbox_runtime_reader_condition = "(${local.acr_repository_reader_action_guard} OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase 'opsrabbit/opensandbox-runtime')"
+  backend_image                            = "${azurerm_container_registry.opsrabbit.login_server}/${local.backend_image_repository}@${var.backend_image_digest}"
+  web_image                                = "${azurerm_container_registry.opsrabbit.login_server}/${var.web_image_repository}@${var.web_image_digest}"
 
   backend_healthcheck_command = "node -e \"fetch('http://127.0.0.1:8384/health').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))\""
 
@@ -41,7 +49,7 @@ locals {
   opensandbox_database_url = local.opensandbox_enabled ? "postgresql://${urlencode(postgresql_role.opensandbox[0].name)}:${replace(urlencode(random_password.opensandbox_database[0].result), "+", "%20")}@${azurerm_postgresql_flexible_server.opsrabbit.fqdn}:5432/${replace(urlencode(var.postgresql_database_name), "+", "%20")}?sslmode=require" : null
 
   opensandbox_bootstrap_json = local.opensandbox_enabled ? jsonencode({
-    endpoint = "https://${azurerm_container_app.opensandbox[0].ingress[0].fqdn}"
+    endpoint = local.opensandbox_controller_origin
     apiKey   = random_password.opensandbox_api_key[0].result
     image    = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
   }) : null

@@ -56,13 +56,52 @@ resource "azurerm_user_assigned_identity" "opensandbox" {
   ]
 }
 
+resource "azurerm_user_assigned_identity" "opensandbox_server_pull" {
+  count               = local.opensandbox_enabled ? 1 : 0
+  name                = "${var.identity_name}-sandbox-server-pull"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  tags                = var.tags
+
+  depends_on = [
+    azurerm_resource_group.opsrabbit,
+    data.azurerm_resource_group.existing,
+  ]
+}
+
+resource "azurerm_user_assigned_identity" "opensandbox_runtime_pull" {
+  count               = local.opensandbox_enabled ? 1 : 0
+  name                = "${var.identity_name}-sandbox-runtime-pull"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  tags                = var.tags
+
+  depends_on = [
+    azurerm_resource_group.opsrabbit,
+    data.azurerm_resource_group.existing,
+  ]
+}
+
 resource "azurerm_role_assignment" "opensandbox_acr_pull" {
   count                            = local.opensandbox_enabled ? 1 : 0
   scope                            = azurerm_container_registry.opsrabbit.id
-  role_definition_name             = "AcrPull"
-  principal_id                     = azurerm_user_assigned_identity.opensandbox[0].principal_id
+  role_definition_name             = "Container Registry Repository Reader"
+  principal_id                     = azurerm_user_assigned_identity.opensandbox_server_pull[0].principal_id
   principal_type                   = "ServicePrincipal"
   skip_service_principal_aad_check = true
+  condition                        = local.acr_opensandbox_server_reader_condition
+  condition_version                = "2.0"
+}
+
+resource "azurerm_role_assignment" "opensandbox_runtime_acr_pull" {
+  count                            = local.opensandbox_enabled ? 1 : 0
+  scope                            = azurerm_container_registry.opsrabbit.id
+  role_definition_name             = "Container Registry Repository Reader"
+  principal_id                     = azurerm_user_assigned_identity.opensandbox_runtime_pull[0].principal_id
+  principal_type                   = "ServicePrincipal"
+  skip_service_principal_aad_check = true
+  condition                        = local.acr_opensandbox_runtime_reader_condition
+  condition_version                = "2.0"
 }
 
 resource "azapi_resource" "opensandbox_pool_image_pull" {
@@ -74,7 +113,7 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
 
   identity {
     type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.opensandbox[0].id]
+    identity_ids = [azurerm_user_assigned_identity.opensandbox_runtime_pull[0].id]
   }
 
   body = {
@@ -93,7 +132,7 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
         }]
         ingress = { targetPort = 8080 }
         registryCredentials = {
-          identity = azurerm_user_assigned_identity.opensandbox[0].id
+          identity = azurerm_user_assigned_identity.opensandbox_runtime_pull[0].id
           server   = azurerm_container_registry.opsrabbit.login_server
         }
       }
@@ -109,7 +148,7 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
       }
       sessionNetworkConfiguration = { status = "EgressDisabled" }
       managedIdentitySettings = [{
-        identity  = azurerm_user_assigned_identity.opensandbox[0].id
+        identity  = azurerm_user_assigned_identity.opensandbox_runtime_pull[0].id
         lifecycle = "None"
       }]
     }
@@ -124,7 +163,11 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
     }
   }
 
-  depends_on = [azurerm_role_assignment.opensandbox_acr_pull]
+  depends_on = [
+    azurerm_role_assignment.opensandbox_runtime_acr_pull,
+    azapi_update_resource.acr_repository_mode,
+    time_sleep.acr_role_propagation,
+  ]
 }
 
 resource "azurerm_role_assignment" "opensandbox_session_executor" {
@@ -136,86 +179,87 @@ resource "azurerm_role_assignment" "opensandbox_session_executor" {
   skip_service_principal_aad_check = true
 }
 
-resource "azurerm_container_app" "opensandbox" {
-  count                        = local.opensandbox_enabled ? 1 : 0
-  name                         = var.opensandbox_controller_name
-  container_app_environment_id = azurerm_container_app_environment.opsrabbit[0].id
-  resource_group_name          = var.resource_group_name
-  revision_mode                = "Single"
-  workload_profile_name        = "Consumption"
+# Create the lifecycle settings in the same ARM request as the Container App.
+# A follow-up patch would briefly expose the registry-only identity to app code.
+resource "azapi_resource" "opensandbox" {
+  count     = local.opensandbox_enabled ? 1 : 0
+  type      = "Microsoft.App/containerApps@2025-07-01"
+  name      = var.opensandbox_controller_name
+  parent_id = local.resource_group_id
+  location  = var.location
 
   identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.opensandbox[0].id]
+    type = "UserAssigned"
+    identity_ids = [
+      azurerm_user_assigned_identity.opensandbox[0].id,
+      azurerm_user_assigned_identity.opensandbox_server_pull[0].id,
+    ]
   }
 
-  registry {
-    server   = azurerm_container_registry.opsrabbit.login_server
-    identity = azurerm_user_assigned_identity.opensandbox[0].id
-  }
-
-  secret {
-    name  = "opensandbox-api-key"
-    value = random_password.opensandbox_api_key[0].result
-  }
-
-  secret {
-    name  = "opensandbox-session-database-url"
-    value = local.opensandbox_database_url
-  }
-
-  ingress {
-    # External ingress in a private ACA environment resolves only on its
-    # internal load balancer, which also lets private ACI reach the controller.
-    external_enabled           = true
-    allow_insecure_connections = false
-    target_port                = 8080
-    transport                  = "auto"
-
-    traffic_weight {
-      latest_revision = true
-      percentage      = 100
-    }
-  }
-
-  template {
-    min_replicas                     = 1
-    max_replicas                     = 1
-    termination_grace_period_seconds = 60
-
-    container {
-      name   = "opensandbox"
-      image  = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-server@${var.opensandbox_server_image_digest}"
-      cpu    = 1
-      memory = "2Gi"
-
-      env {
-        name        = "OPENSANDBOX_API_KEY"
-        secret_name = "opensandbox-api-key"
+  body = {
+    properties = {
+      managedEnvironmentId = azurerm_container_app_environment.opsrabbit[0].id
+      workloadProfileName  = "Consumption"
+      configuration = {
+        activeRevisionsMode = "Single"
+        identitySettings = [
+          {
+            identity  = azurerm_user_assigned_identity.opensandbox[0].id
+            lifecycle = "Main"
+          },
+          {
+            identity  = azurerm_user_assigned_identity.opensandbox_server_pull[0].id
+            lifecycle = "None"
+          },
+        ]
+        ingress = {
+          external      = true
+          allowInsecure = false
+          targetPort    = 8080
+          transport     = "auto"
+          traffic = [{
+            latestRevision = true
+            weight         = 100
+          }]
+        }
+        registries = [{
+          server   = azurerm_container_registry.opsrabbit.login_server
+          identity = azurerm_user_assigned_identity.opensandbox_server_pull[0].id
+        }]
+        secrets = [
+          {
+            name  = "opensandbox-api-key"
+            value = random_password.opensandbox_api_key[0].result
+          },
+          {
+            name  = "opensandbox-session-database-url"
+            value = local.opensandbox_database_url
+          },
+        ]
       }
-      env {
-        name        = "AZURE_SESSION_DATABASE_URL"
-        secret_name = "opensandbox-session-database-url"
-      }
-      env {
-        name  = "AZURE_CLIENT_ID"
-        value = azurerm_user_assigned_identity.opensandbox[0].client_id
-      }
-      env {
-        name  = "AZURE_SESSION_IMAGE"
-        value = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
-      }
-      env {
-        name  = "AZURE_SESSION_ENDPOINT"
-        value = azapi_resource.opensandbox_pool_image_pull[0].output.properties.poolManagementEndpoint
-      }
-      env {
-        name  = "AZURE_SESSION_MAX_SESSIONS"
-        value = tostring(var.opensandbox_max_sessions)
-      }
-      env {
-        name  = "OPENSANDBOX_CREDENTIAL_GENERATION"
-        value = random_id.opensandbox_credential_revision[0].hex
+      template = {
+        scale = {
+          minReplicas = 1
+          maxReplicas = 1
+        }
+        terminationGracePeriodSeconds = 60
+        containers = [{
+          name  = "opensandbox"
+          image = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-server@${var.opensandbox_server_image_digest}"
+          resources = {
+            cpu    = 1
+            memory = "2Gi"
+          }
+          env = [
+            { name = "OPENSANDBOX_API_KEY", secretRef = "opensandbox-api-key" },
+            { name = "AZURE_SESSION_DATABASE_URL", secretRef = "opensandbox-session-database-url" },
+            { name = "AZURE_CLIENT_ID", value = azurerm_user_assigned_identity.opensandbox[0].client_id },
+            { name = "AZURE_SESSION_IMAGE", value = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}" },
+            { name = "AZURE_SESSION_ENDPOINT", value = azapi_resource.opensandbox_pool_image_pull[0].output.properties.poolManagementEndpoint },
+            { name = "AZURE_SESSION_MAX_SESSIONS", value = tostring(var.opensandbox_max_sessions) },
+            { name = "OPENSANDBOX_CREDENTIAL_GENERATION", value = random_id.opensandbox_credential_revision[0].hex },
+          ]
+        }]
       }
     }
   }
@@ -231,7 +275,10 @@ resource "azurerm_container_app" "opensandbox" {
 
   depends_on = [
     azurerm_role_assignment.opensandbox_acr_pull,
+    azurerm_role_assignment.opensandbox_runtime_acr_pull,
     azurerm_role_assignment.opensandbox_session_executor,
+    azapi_update_resource.acr_repository_mode,
     postgresql_schema.opensandbox,
+    time_sleep.acr_role_propagation,
   ]
 }

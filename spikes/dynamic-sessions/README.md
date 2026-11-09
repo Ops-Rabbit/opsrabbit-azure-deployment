@@ -30,7 +30,8 @@ part of an enabled application deployment; browser execution remains unsupported
   check Azure allocation before sending a request that could allocate a session.
 - Explicit rejection of arbitrary images, registry credentials, environment
   injection, volumes, lifecycle hooks, per-session network rules, unsupported
-  ports, snapshots, pause/resume, renewal and metadata mutation.
+  ports, snapshots, pause/resume, metadata mutation, and renewal beyond the
+  absolute one-hour lifetime cap.
 
 The required `sleep infinity` entrypoint describes the fixed long-running pool
 contract; the image always starts restricted execd. The adapter rejects other
@@ -39,8 +40,9 @@ entrypoints instead of silently running an arbitrary caller-provided command.
 ## Trust boundaries
 
 The controller uses a dedicated user-assigned managed identity with Session
-Executor at the exact pool scope. A separate image-pull identity has only AcrPull
-on the proof registry and pool identity lifecycle `None`. No controller key or
+Executor at the exact pool scope. A separate image-pull identity has only
+`Container Registry Repository Reader`, scoped to the exact proof image
+repository, and pool identity lifecycle `None`. No controller key or
 Azure access token is forwarded into the execution container or returned in
 endpoint metadata.
 
@@ -92,14 +94,16 @@ inventory. Never put credentials or customer-specific resource IDs in this repo.
    credentials disabled.
 2. Build/publish `Dockerfile.runtime` and `Dockerfile.server`; resolve both tags to
    immutable registry digests before deployment.
-3. Create an image-pull identity and assign AcrPull at registry scope.
+3. Create an image-pull identity and assign `Container Registry Repository Reader`
+   with an ABAC condition limited to `opsrabbit/opensandbox-runtime`.
 4. Create a `Microsoft.App/sessionPools` custom-container Dynamic pool using the
    environment, runtime digest, port 8080, 0.5 CPU/1Gi, two maximum sessions, one
    ready instance, 3600-second timed idle cooldown, `EgressDisabled`, and image-pull
    identity lifecycle `None`. ARM API `2025-07-01` was used to deploy it; API
    `2026-07-01` exposes template rollout and readiness details.
 5. Create a separate controller identity. Grant it Azure ContainerApps Session Executor on this pool
-   and AcrPull on the registry. Do not grant these permissions to sessions.
+   and repository-scoped `Container Registry Repository Reader` for
+   `opsrabbit/opensandbox-server`. Do not grant these permissions to sessions.
 6. Deploy the server digest as a single-replica Container App, with HTTPS-only
    port 8080 ingress and an IP allowlist for the test client. Inject a strong
    generated `OPENSANDBOX_API_KEY` using an ACA secret, not plaintext checked-in
@@ -161,10 +165,11 @@ cleanup check fails.
 - Tenant authorization belongs to the trusted caller in this proof. It is not
   acceptance of OpsRabbit multi-tenant authorization or upstream tenant mode.
 - The minimal runtime, denied egress and fixed image cannot satisfy all
-  OpsRabbit tool workloads. Browser execution, renewals, sustained concurrency,
+  OpsRabbit tool workloads. Browser execution, sustained concurrency,
   customer-network acceptance and multi-replica coordination remain unsupported.
-- Current pinned server and runtime images scan with zero Critical findings and
-  47 High findings each; Trivy reports no fixed versions for those High findings.
+- The latest completed server scan reported zero Critical and 47 High findings.
+  The current runtime image scan is pending; review its results before accepting
+  either image for production.
   This is not image-security acceptance. Review the findings against an approved
   risk policy or update the base/dependency versions before customer release.
 - Building this proof uses pinned top-level Python packages, but a full hashed

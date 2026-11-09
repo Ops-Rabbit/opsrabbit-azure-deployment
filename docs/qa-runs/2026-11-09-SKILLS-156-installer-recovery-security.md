@@ -1,6 +1,6 @@
 # SKILLS-156 installer, recovery, and image scan checks
 
-Observed 2026-11-09. These are local code and container tests only. The Azure
+Observed 2026-11-09 15:41 UTC. These are local code and unit tests only. The Azure
 environment was torn down at the user's direction and was not recreated.
 
 ## Installer integration
@@ -22,6 +22,20 @@ environment was torn down at the user's direction and was not recreated.
   bootstrap. Controller admission capacity follows the Terraform pool limit.
 - Sandbox leases are capped at one hour to match the Dynamic Sessions maximum
   idle cooldown; Azure can retire an idle session sooner than its requested expiry.
+- ACR uses RBAC plus ABAC repository permissions. The app image identity is
+  limited to its backend and web repositories; separate identities read only
+  the OpenSandbox server and runtime repositories. The controller execution
+  identity has no ACR data role and receives Session Executor only on its exact
+  pool. ACA lifecycle settings keep the server pull identity unavailable to
+  controller code; Dynamic Sessions keeps the runtime pull identity unavailable
+  to sandbox code.
+- Repository-scoped Reader assignments use ACR's documented
+  `registries/repositories:name` attribute and are created before ACR switches
+  from legacy role permissions to ABAC. A trigger-aware five-minute Terraform
+  propagation barrier precedes the mode switch and image pulls. README documents
+  the temporary registry-wide import role and repository-scoped Writer roles
+  needed by customer operators. The old `AcrPull` assignment remains tracked for
+  upgrade continuity; ACR ignores it after the switch.
 
 ## Durable recovery
 
@@ -37,28 +51,28 @@ single-replica; multi-replica coordination and browser execution are unsupported
 
 | Check | Result |
 | --- | --- |
-| PostgreSQL restart recovery, schema permissions, and lost-leader recovery | Five integration cases pending hosted CI; local Postgres container could not start because Docker image storage returns I/O errors |
-| PostgreSQL schema cascade teardown regression | Added; pending hosted CI because local Docker image storage returns I/O errors |
-| Overlapping-controller recovery fence | Added PostgreSQL advisory-lock test; pending hosted CI because local Docker image storage returns I/O errors |
-| Adapter contract, concurrency, route allowlist, and SQLite recovery tests | PASS, 37/37 |
+| PostgreSQL restart recovery, schema permissions, schema teardown, lost-leader recovery, and overlapping-controller fence | Passed in hosted run 42626494905; rerun required for this updated candidate |
+| PostgreSQL lock-order recovery regression | Added locally; awaits the PR-hosted PostgreSQL service because this machine has PostgreSQL client tools but no server |
+| Adapter contract, concurrency, route allowlist, SQLite recovery, and fixed absolute renewal limit | PASS, 38/38 |
 | Real OpenSandbox server startup/authentication | PASS in hosted CI run 42622842799 |
 | Runtime gateway, file-path confinement, minimal mount view, and worker launch tests | PASS, 19/19 |
-| Direct runtime command isolation and generated-file download | First hosted attempt exposed the runner's user-namespace restriction; test-only seccomp override added, rerun pending |
+| Direct runtime command isolation and generated-file download | Hosted run 42626494905 failed because the runner blocks Bubblewrap namespace setup; no customer runtime setting was weakened |
 | Server image scan | PASS gate in hosted run 42622842799: 0 Critical, 47 High |
-| Runtime image scan | Pending: CI stopped at direct runtime test before reaching this scan |
-| Image-security acceptance | Open pending runtime scan and security-owner disposition of server's 47 High findings |
-| Focused ACA Terraform topology tests | PASS, 10/10 (previous run) |
+| Runtime image scan | Pending hosted run with scans ordered before the direct runtime test |
+| Image-security acceptance | Open pending both final image scans and security-owner disposition of High findings |
+| Focused ACA Terraform topology tests | PASS, 13/13 (current local candidate) |
 | Terraform formatting and validation | PASS |
-| Full Terraform test suite | PASS, 27/27 (including private ACA DNS and private ACI bootstrap topology) |
+| Full Terraform test suite | PASS, 29/29 (including private ACA DNS, private ACI topology, ABAC roles, propagation wait, and atomic identity lifecycle settings) |
 | Product OpenSandbox targeted tests | PASS, 143/143 |
 | Product changed backend line coverage | initializer 100%; verifier 100%; execution 85.62% |
 | Product TypeScript check and quality lint | PASS |
+| Product installer and verifier tests on PR head `321fb6df7` | PASS, 64/64; backend TypeScript check and Biome pass (local Node 24.22.1 emits an engine-floor warning; required is 24.22.2) |
 | Strict Semgrep scan of changed product source | PASS, 0 findings |
 | Strict Semgrep scan of updated installer runtime source | Not rerun; Semgrep is unavailable in this shell |
 | Ruff 0.14.8 lint and format for all spike code | PASS |
 | Python bytecode compilation and image-build shell syntax | PASS |
 | Direct runtime container command/file test | Pending hosted CI; Docker image store returns an I/O error locally |
-| Independent code reviews and autoreview | Autoreview clean for P0–P2 at 2026-11-09 13:23 UTC; GitHub connector review of the latest pushed candidate pending |
+| Independent autoreview | PASS at P1 threshold for this candidate; GitHub connector review must follow the next push |
 
 The first final review caught an incorrect Azure role name and two protocol
 edge cases in the runtime gateway. The role now uses Microsoft's documented
@@ -80,12 +94,16 @@ canonicalizes query, JSON, and multipart paths, including symlink targets, and
 rejects traversal before forwarding to execd. Its allowed routes match the
 runtime gateway, including search, move, permissions, and replace operations.
 The controller holds a PostgreSQL advisory lock across recovery and service to
-prevent overlapping ACA revisions from reconciling the same journal. Startup
-recovery validates active rows before public readiness is enabled. It monitors
-that lock connection
-and exits on database connection loss so ACA can restart it and replay durable
-recovery. The installer probes backend image capabilities before migration, and
-both ACA apps have revision markers for generated credential rotations. The
+prevent overlapping ACA revisions from reconciling the same journal. It releases
+the in-process journal lock during recovery I/O, preserving the request path's
+session-lock-then-journal-lock order and avoiding a revision-handover deadlock.
+Startup recovery validates active rows before public readiness is enabled. It
+monitors that advisory-lock connection and exits on database connection loss so
+ACA can restart it and replay durable recovery. A concurrent request regression
+test covers this lock ordering; the hosted PostgreSQL run is pending. The
+installer probes backend image capabilities
+before migration, and both ACA apps have revision markers for generated
+credential rotations. The
 SQLite fallback transitions interrupted allocations to retirement on restart.
 Slow session allocation does not hold the controller database lock during Azure
 network calls; per-session locks keep operations on one sandbox ordered. The
@@ -117,6 +135,27 @@ review also suggested a missing Consumption workload profile, but the shared
 ACA environment already declares that profile in `container-apps.tf`; Terraform
 validation and topology tests pass with it present.
 
+The security review identified that controller execution and all image pulls
+shared one managed identity with registry-wide `AcrPull`. The updated candidate
+separates controller execution, server image pull, and session image pull;
+conditions Reader roles to exact repositories; enables ACR ABAC only after
+those roles are in place; waits five minutes for role propagation when the
+grants change; and restricts the controller's image-pull identity to the
+image-pull lifecycle in the same ARM create/update request. The legacy app
+`AcrPull` grant remains tracked during and after migration; it becomes
+ineffective when ACR switches to ABAC. Terraform assertions cover these
+boundaries. Azure
+documents that legacy ACR roles are ignored in ABAC mode, so README now covers
+the migration and customer operator role requirements.
+
+The first fresh autoreview caught two upgrade/security gaps. The existing
+`AcrPull` assignment is now retained while repository Reader grants propagate
+and ACR switches to ABAC; it becomes ineffective in ABAC mode. The OpenSandbox
+controller now uses an AzAPI create/update request that includes both the
+server-pull identity and its `None` lifecycle setting atomically, avoiding a
+window where the controller could request that identity's token. Terraform
+tests assert both migration sequencing inputs and lifecycle identity pairing.
+
 The next review found two lifecycle gaps. ACI now receives a non-secret
 bootstrap fingerprint so server/runtime digest or pool-capacity changes replace
 the group and rerun verification. Allocation and retirement share a per-session
@@ -128,24 +167,27 @@ connect/write/pool timeouts remain bounded at 45 seconds.
 The PostgreSQL active-session fixture now includes its pinned image URI so the
 hosted recovery test exercises the intended same-image revalidation path.
 
-Ruff lint and format, Python bytecode compilation, 37 adapter tests, 19 runtime
-tests, and 27 Terraform tests pass. The real server build/startup, PostgreSQL
-tests, and direct container test are in hosted CI because Docker Desktop's local
-image store returns I/O errors, including when listing images. Hosted run
-42622842799 passed adapter, PostgreSQL recovery, server startup, and server
-image scanning, then failed the direct runtime test because the GitHub runner's
-outer seccomp policy denied Bubblewrap's user-namespace syscall. The smoke test
-now uses a test-only seccomp override and reports container exit state; no
-deployment security setting changed. The runtime image scan was not reached.
+Ruff lint and format, Python bytecode compilation, 38 adapter tests, 19 runtime
+tests, and 29 Terraform tests pass locally. The adapter tests use the pinned
+OpenSandbox 1.1.1 package in an isolated local Python environment. The real
+server build/startup, PostgreSQL integration tests, and direct container test
+require hosted execution because Docker Desktop's local image store returns
+I/O errors, including when listing images. Hosted runs 42622842799 and
+42626494905 passed PostgreSQL recovery, server startup, and server image
+scanning, then failed the direct runtime test because the runner denied
+Bubblewrap's namespace setup. The earlier test-only overrides did not fix the
+hosted runner restriction. The smoke test now also disables the outer AppArmor
+profile for its synthetic container only; it remains on the ephemeral runner,
+with a read-only token and internal-only container network. Both image scans run before the runtime smoke test, so
+scan evidence is captured even if the runner limitation continues.
 
 Autoreview found and prompted fixes for the missing read-only `/usr/local`
 mount, command-stream timeout being shorter than valid command durations, and
 the hosted test's early port inspection. The command worker now mounts
 `/usr/local` read-only; the gateway derives its stream timeout from the command
 deadline up to the one-hour session cap; and the smoke test waits for port
-publication. Latest follow-up autoreview completed clean for P0–P2 at
-2026-11-09 13:23 UTC. GitHub connector review of the latest pushed candidate is
-pending.
+publication. The current changes still require a fresh autoreview and GitHub
+connector review.
 
 The customer image helper was adjusted so it builds OCI layouts, scans those
 exact layouts before publication, then copies the same digest and attestations
@@ -158,12 +200,11 @@ The tests do not constitute a new live Azure installation or deployment test.
 ## Image scan
 
 The latest hosted server image scan (run 42622842799) reported zero Critical
-and 47 High findings. The run failed before scanning the runtime image because
-the runner blocked Bubblewrap's user namespace; that test-only runner setting
-has now been adjusted, and the next run will scan both images. The hosted proof
-workflow prints High/Critical findings and fails on any Critical finding. The
-High findings are not waived. Image-security acceptance remains open pending
-the runtime scan and security-owner disposition of the 47 High findings.
+and 47 High findings. The next hosted run will scan both images before the
+runtime smoke test. The workflow prints High/Critical findings and fails on any
+Critical finding. The High findings are not waived. Image-security acceptance
+remains open until both final reports are reviewed and a security owner records
+disposition for the findings.
 
 No Azure images were published, Terraform was not applied to a subscription, and
 the previous Azure setup was not recreated during this validation.

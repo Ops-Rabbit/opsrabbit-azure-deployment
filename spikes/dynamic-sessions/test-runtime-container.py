@@ -36,8 +36,10 @@ def main(image):
                 "-d",
                 "--network",
                 network,
-                # GitHub's outer Docker seccomp profile blocks Bubblewrap's
-                # user-namespace and mount setup; these overrides are test-only.
+                # Exercise Bubblewrap mount isolation on the ephemeral,
+                # read-only-token CI runner; this is test-container-only.
+                "--security-opt",
+                "apparmor=unconfined",
                 "--security-opt",
                 "seccomp=unconfined",
                 "--cap-add",

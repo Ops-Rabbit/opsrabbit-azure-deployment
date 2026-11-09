@@ -324,7 +324,7 @@ variable "container_app_name" {
   default     = "ca-opsrabbit"
 
   validation {
-    condition     = length(var.container_app_name) >= 2 && length(var.container_app_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.container_app_name))
+    condition     = length(var.container_app_name) >= 2 && length(var.container_app_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.container_app_name)) && !strcontains(var.container_app_name, "--")
     error_message = "container_app_name must contain 2-32 lowercase letters, numbers, or hyphens, start with a letter, and end with a letter or number."
   }
 }
@@ -335,7 +335,7 @@ variable "opensandbox_controller_name" {
   default     = "ca-opensandbox"
 
   validation {
-    condition     = length(var.opensandbox_controller_name) >= 2 && length(var.opensandbox_controller_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.opensandbox_controller_name))
+    condition     = length(var.opensandbox_controller_name) >= 2 && length(var.opensandbox_controller_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.opensandbox_controller_name)) && !strcontains(var.opensandbox_controller_name, "--")
     error_message = "opensandbox_controller_name must be a valid Azure Container App name."
   }
 }
