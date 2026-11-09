@@ -37,9 +37,11 @@ def main(image):
                 "--network",
                 network,
                 # GitHub's outer Docker seccomp profile blocks Bubblewrap's
-                # user-namespace syscall; this override is test-only.
+                # user-namespace and mount setup; these overrides are test-only.
                 "--security-opt",
                 "seccomp=unconfined",
+                "--cap-add",
+                "SYS_ADMIN",
                 "-p",
                 "127.0.0.1::8080",
                 image,
