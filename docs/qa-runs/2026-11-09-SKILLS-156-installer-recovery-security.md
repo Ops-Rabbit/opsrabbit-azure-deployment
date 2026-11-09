@@ -1,6 +1,6 @@
 # SKILLS-156 installer, recovery, and image scan checks
 
-Observed 2026-11-09 16:21 UTC. No Azure resources were recreated. The Azure
+Observed 2026-11-09 16:28 UTC. No Azure resources were recreated. The Azure
 environment remains torn down at the user's direction.
 
 ## Installer integration
@@ -55,9 +55,9 @@ single-replica; multi-replica coordination and browser execution are unsupported
 | Adapter contract, concurrency, route allowlist, SQLite recovery, and fixed absolute renewal limit | PASS, 38/38 |
 | Real OpenSandbox server startup/authentication | PASS in hosted CI run 42622842799 |
 | Runtime gateway, file-path confinement, minimal mount view, and worker launch tests | PASS, 19/19 |
-| Direct runtime command isolation and generated-file download | PASS in hosted run 42653292248 using the internal bridge address without publishing a host port |
-| Server image scan | PASS gate in hosted run 42653292248: 0 Critical, 47 High |
-| Runtime image scan | PASS gate in hosted run 42653292248: 0 Critical, 47 High |
+| Direct runtime command isolation and generated-file download | PASS in hosted run 42654310908 using the internal bridge address without publishing a host port |
+| Server image scan | PASS gate in hosted run 42654310908: 0 Critical, 47 High |
+| Runtime image scan | PASS gate in hosted run 42654310908: 0 Critical, 47 High |
 | Image-security acceptance | Both scan gates pass; security-owner disposition of 47 High findings per image remains outstanding |
 | Focused ACA Terraform topology tests | PASS, 13/13 (current local candidate) |
 | Terraform formatting and validation | PASS |
@@ -65,7 +65,7 @@ single-replica; multi-replica coordination and browser execution are unsupported
 | Product OpenSandbox targeted tests | PASS, 143/143 |
 | Product changed backend line coverage | initializer 100%; verifier 100%; execution 85.62% |
 | Product TypeScript check and quality lint | PASS |
-| Product installer and verifier tests on PR head `f68e6d5c0` | PASS, 68/68; backend TypeScript check and Biome pass (local Node 24.22.1 emits an engine-floor warning; required is 24.22.2) |
+| Product installer and verifier tests on PR head `e63beef61` | PASS, 69/69; backend TypeScript check and Biome pass (local Node 24.22.1 emits an engine-floor warning; required is 24.22.2) |
 | Strict Semgrep scan of changed product source | PASS, 0 findings |
 | Strict Semgrep scan of updated installer runtime source | Not rerun; Semgrep is unavailable in this shell |
 | Ruff 0.14.8 lint and format for all spike code | PASS |
@@ -100,7 +100,7 @@ Startup recovery validates active rows before public readiness is enabled. It
 monitors that advisory-lock connection and exits on database connection loss so
 ACA can restart it and replay durable recovery. A concurrent request regression
 test covers this lock ordering; it passed with the rest of the PostgreSQL suite
-in hosted run 42653292248. The
+in hosted run 42654310908. The
 installer probes backend image capabilities
 before migration, and both ACA apps have revision markers for generated
 credential rotations. The
@@ -172,7 +172,7 @@ tests, and 29 Terraform tests pass locally. The adapter tests use the pinned
 OpenSandbox 1.1.1 package in an isolated local Python environment. The real
 server build/startup, PostgreSQL integration tests, and direct container test
 require hosted execution because Docker Desktop's local image store returns
-I/O errors, including when listing images. Hosted run 42653292248 passed
+I/O errors, including when listing images. Hosted run 42654310908 passed
 PostgreSQL recovery, server startup/authentication, both image-scan gates
 (47 High and zero Critical findings per image), and the direct command/file
 smoke test over the internal bridge without publishing a host port. AppArmor,
