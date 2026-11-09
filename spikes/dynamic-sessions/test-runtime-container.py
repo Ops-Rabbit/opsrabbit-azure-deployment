@@ -42,14 +42,29 @@ def main(image):
             ],
             text=True,
         ).strip()
-        inspected = json.loads(
-            subprocess.check_output(["docker", "inspect", container])
-        )[0]
-        mappings = inspected["NetworkSettings"]["Ports"].get("8080/tcp") or []
+        deadline = time.monotonic() + 30
+        mappings = []
+        inspected = None
+        while time.monotonic() < deadline:
+            inspected = json.loads(
+                subprocess.check_output(["docker", "inspect", container])
+            )[0]
+            mappings = inspected["NetworkSettings"]["Ports"].get("8080/tcp") or []
+            if mappings:
+                break
+            state = inspected["State"]
+            if not state["Running"]:
+                logs = subprocess.check_output(["docker", "logs", container], text=True)
+                raise RuntimeError(
+                    "runtime container exited before publishing its port "
+                    f"(exit={state['ExitCode']}, error={state['Error']!r}, "
+                    f"oom={state['OOMKilled']}): {logs[-2000:]}"
+                )
+            time.sleep(0.1)
         if not mappings:
-            logs = subprocess.check_output(["docker", "logs", container], text=True)
             raise RuntimeError(
-                "runtime container exited before publishing its port: " + logs[-1000:]
+                "runtime container did not publish its port within 30 seconds: "
+                + json.dumps(inspected["State"], sort_keys=True)
             )
         port = int(mappings[0]["HostPort"])
         for _ in range(120):
