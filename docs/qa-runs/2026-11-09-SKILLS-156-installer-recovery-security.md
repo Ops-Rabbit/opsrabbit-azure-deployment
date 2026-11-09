@@ -51,22 +51,21 @@ single-replica; multi-replica coordination and browser execution are unsupported
 
 | Check | Result |
 | --- | --- |
-| PostgreSQL restart recovery, schema permissions, schema teardown, lost-leader recovery, and overlapping-controller fence | Passed in hosted run 42626494905; rerun required for this updated candidate |
-| PostgreSQL lock-order recovery regression | Added locally; awaits the PR-hosted PostgreSQL service because this machine has PostgreSQL client tools but no server |
+| PostgreSQL restart recovery, schema permissions, schema teardown, lost-leader recovery, overlapping-controller fence, and lock-order regression | PASS in hosted run 42651517438 |
 | Adapter contract, concurrency, route allowlist, SQLite recovery, and fixed absolute renewal limit | PASS, 38/38 |
 | Real OpenSandbox server startup/authentication | PASS in hosted CI run 42622842799 |
 | Runtime gateway, file-path confinement, minimal mount view, and worker launch tests | PASS, 19/19 |
-| Direct runtime command isolation and generated-file download | Hosted run 42626494905 failed because the runner blocks Bubblewrap namespace setup; no customer runtime setting was weakened |
-| Server image scan | PASS gate in hosted run 42622842799: 0 Critical, 47 High |
-| Runtime image scan | Pending hosted run with scans ordered before the direct runtime test |
-| Image-security acceptance | Open pending both final image scans and security-owner disposition of High findings |
+| Direct runtime command isolation and generated-file download | Run 42651517438 failed because the internal-network container did not expose a host port; test now uses its internal bridge address and awaits hosted rerun |
+| Server image scan | PASS gate in hosted run 42651517438: 0 Critical, 47 High |
+| Runtime image scan | PASS gate in hosted run 42651517438: 0 Critical, 47 High |
+| Image-security acceptance | Both scan gates pass; security-owner disposition of 47 High findings per image remains outstanding |
 | Focused ACA Terraform topology tests | PASS, 13/13 (current local candidate) |
 | Terraform formatting and validation | PASS |
 | Full Terraform test suite | PASS, 29/29 (including private ACA DNS, private ACI topology, ABAC roles, propagation wait, and atomic identity lifecycle settings) |
 | Product OpenSandbox targeted tests | PASS, 143/143 |
 | Product changed backend line coverage | initializer 100%; verifier 100%; execution 85.62% |
 | Product TypeScript check and quality lint | PASS |
-| Product installer and verifier tests on PR head `321fb6df7` | PASS, 64/64; backend TypeScript check and Biome pass (local Node 24.22.1 emits an engine-floor warning; required is 24.22.2) |
+| Product installer and verifier tests on PR head `f01556073` | PASS, 65/65; backend TypeScript check and Biome pass (local Node 24.22.1 emits an engine-floor warning; required is 24.22.2) |
 | Strict Semgrep scan of changed product source | PASS, 0 findings |
 | Strict Semgrep scan of updated installer runtime source | Not rerun; Semgrep is unavailable in this shell |
 | Ruff 0.14.8 lint and format for all spike code | PASS |
@@ -100,7 +99,8 @@ session-lock-then-journal-lock order and avoiding a revision-handover deadlock.
 Startup recovery validates active rows before public readiness is enabled. It
 monitors that advisory-lock connection and exits on database connection loss so
 ACA can restart it and replay durable recovery. A concurrent request regression
-test covers this lock ordering; the hosted PostgreSQL run is pending. The
+test covers this lock ordering; it passed with the rest of the PostgreSQL suite
+in hosted run 42651517438. The
 installer probes backend image capabilities
 before migration, and both ACA apps have revision markers for generated
 credential rotations. The
@@ -172,14 +172,14 @@ tests, and 29 Terraform tests pass locally. The adapter tests use the pinned
 OpenSandbox 1.1.1 package in an isolated local Python environment. The real
 server build/startup, PostgreSQL integration tests, and direct container test
 require hosted execution because Docker Desktop's local image store returns
-I/O errors, including when listing images. Hosted runs 42622842799 and
-42626494905 passed PostgreSQL recovery, server startup, and server image
-scanning, then failed the direct runtime test because the runner denied
-Bubblewrap's namespace setup. The earlier test-only overrides did not fix the
-hosted runner restriction. The smoke test now also disables the outer AppArmor
-profile for its synthetic container only; it remains on the ephemeral runner,
-with a read-only token and internal-only container network. Both image scans run before the runtime smoke test, so
-scan evidence is captured even if the runner limitation continues.
+I/O errors, including when listing images. Hosted run 42651517438 passed
+PostgreSQL recovery, server startup/authentication, and both image-scan gates
+(47 High and zero Critical findings per image). Its direct runtime test failed
+because the internal-network container did not expose a host port. The revised
+smoke test connects directly to the container's address on the internal bridge,
+retaining the no-egress network without publishing a host port; that retest is
+pending. AppArmor, seccomp, and SYS_ADMIN overrides apply only to the synthetic
+CI container.
 
 Autoreview found and prompted fixes for the missing read-only `/usr/local`
 mount, command-stream timeout being shorter than valid command durations, and

@@ -9,8 +9,8 @@ import time
 import uuid
 
 
-def request(port, path, method="GET", body=None, headers=None, timeout=15):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+def request(host, path, method="GET", body=None, headers=None, timeout=15):
+    connection = http.client.HTTPConnection(host, 8080, timeout=timeout)
     try:
         connection.request(method, path, body=body, headers=headers or {})
         response = connection.getresponse()
@@ -44,21 +44,25 @@ def main(image):
                 "seccomp=unconfined",
                 "--cap-add",
                 "SYS_ADMIN",
-                "-p",
-                "127.0.0.1::8080",
+                # Reach the container on its internal bridge address from the
+                # runner instead of publishing a host port.
                 image,
             ],
             text=True,
         ).strip()
         deadline = time.monotonic() + 30
-        mappings = []
+        host = None
         inspected = None
         while time.monotonic() < deadline:
             inspected = json.loads(
                 subprocess.check_output(["docker", "inspect", container])
             )[0]
-            mappings = inspected["NetworkSettings"]["Ports"].get("8080/tcp") or []
-            if mappings:
+            host = (
+                inspected["NetworkSettings"]["Networks"]
+                .get(network, {})
+                .get("IPAddress")
+            )
+            if host:
                 break
             state = inspected["State"]
             if not state["Running"]:
@@ -69,15 +73,20 @@ def main(image):
                     f"oom={state['OOMKilled']}): {logs[-2000:]}"
                 )
             time.sleep(0.1)
-        if not mappings:
+        if not host:
             raise RuntimeError(
-                "runtime container did not publish its port within 30 seconds: "
-                + json.dumps(inspected["State"], sort_keys=True)
+                "runtime container did not join its isolated network within 30 seconds: "
+                + json.dumps(
+                    {
+                        "state": inspected["State"],
+                        "networks": inspected["NetworkSettings"]["Networks"],
+                    },
+                    sort_keys=True,
+                )
             )
-        port = int(mappings[0]["HostPort"])
         for _ in range(120):
             try:
-                status, _ = request(port, "/ping", timeout=3)
+                status, _ = request(host, "/ping", timeout=3)
                 if status == 200:
                     break
             except (OSError, http.client.HTTPException):
@@ -98,7 +107,7 @@ def main(image):
             "accessTokenHash": "sha256:" + hashlib.sha256(token.encode()).hexdigest(),
         }
         status, _ = request(
-            port,
+            host,
             "/internal/init",
             "POST",
             json.dumps(binding),
@@ -113,7 +122,7 @@ def main(image):
             "printf generated-by-command > /workspace/generated.txt && printf isolation-ok"
         )
         status, body = request(
-            port,
+            host,
             "/command",
             "POST",
             json.dumps(
@@ -138,7 +147,7 @@ def main(image):
             raise RuntimeError(f"isolated command failed with HTTP {status}")
 
         status, body = request(
-            port,
+            host,
             "/files/download?path=%2Fworkspace%2Fgenerated.txt",
             headers={"X-EXECD-ACCESS-TOKEN": token},
         )
