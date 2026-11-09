@@ -22,6 +22,17 @@ class GatewayLifecycleTests(unittest.TestCase):
         self.g["command"].poll.return_value = None
         self.g["files"].poll.return_value = None
 
+    def test_command_timeout_includes_runtime_margin(self):
+        timeout = self.g["request_timeout"]("POST", "/command", b'{"timeout":180000}')
+        self.assertEqual(timeout, 210)
+
+    def test_command_timeout_is_capped_at_session_maximum(self):
+        timeout = self.g["request_timeout"]("POST", "/command", b'{"timeout":7200000}')
+        self.assertEqual(timeout, 3600)
+
+    def test_other_requests_keep_the_short_timeout(self):
+        self.assertEqual(self.g["request_timeout"]("GET", "/files/info", b""), 120)
+
     def test_admission_requires_both_workers(self):
         response = Mock(status=200)
         connection = Mock()

@@ -41,10 +41,12 @@ single-replica; multi-replica coordination and browser execution are unsupported
 | PostgreSQL schema cascade teardown regression | Added; pending hosted CI because local Docker image storage returns I/O errors |
 | Overlapping-controller recovery fence | Added PostgreSQL advisory-lock test; pending hosted CI because local Docker image storage returns I/O errors |
 | Adapter contract, concurrency, route allowlist, and SQLite recovery tests | PASS, 37/37 |
-| Real OpenSandbox server startup/authentication | Previously passed; not rerun because Docker image storage returns I/O errors |
-| Runtime gateway, file-path confinement, minimal mount view, and worker launch tests | PASS, 16/16 |
-| Direct runtime command isolation and generated-file download | Added to CI; local container execution blocked by Docker Desktop namespace/storage errors |
-| Final candidate OCI image scans | Added to hosted CI: report HIGH/CRITICAL findings and fail on any CRITICAL finding; final scan and High finding disposition pending |
+| Real OpenSandbox server startup/authentication | PASS in hosted CI run 42622842799 |
+| Runtime gateway, file-path confinement, minimal mount view, and worker launch tests | PASS, 19/19 |
+| Direct runtime command isolation and generated-file download | First hosted attempt exposed the runner's user-namespace restriction; test-only seccomp override added, rerun pending |
+| Server image scan | PASS gate in hosted run 42622842799: 0 Critical, 47 High |
+| Runtime image scan | Pending: CI stopped at direct runtime test before reaching this scan |
+| Image-security acceptance | Open pending runtime scan and security-owner disposition of server's 47 High findings |
 | Focused ACA Terraform topology tests | PASS, 10/10 (previous run) |
 | Terraform formatting and validation | PASS |
 | Full Terraform test suite | PASS, 27/27 (including private ACA DNS and private ACI bootstrap topology) |
@@ -56,7 +58,7 @@ single-replica; multi-replica coordination and browser execution are unsupported
 | Ruff 0.14.8 lint and format for all spike code | PASS |
 | Python bytecode compilation and image-build shell syntax | PASS |
 | Direct runtime container command/file test | Pending hosted CI; Docker image store returns an I/O error locally |
-| Independent code reviews and autoreview | Autoreview clean for P0–P2 at 2026-11-09 12:54 UTC; GitHub connector review of the pushed candidate pending |
+| Independent code reviews and autoreview | Autoreview clean for P0–P2 at 2026-11-09 13:23 UTC; GitHub connector review of the latest pushed candidate pending |
 
 The first final review caught an incorrect Azure role name and two protocol
 edge cases in the runtime gateway. The role now uses Microsoft's documented
@@ -126,15 +128,24 @@ connect/write/pool timeouts remain bounded at 45 seconds.
 The PostgreSQL active-session fixture now includes its pinned image URI so the
 hosted recovery test exercises the intended same-image revalidation path.
 
-Ruff lint and format, Python bytecode compilation, 37 adapter tests, 16 runtime
+Ruff lint and format, Python bytecode compilation, 37 adapter tests, 19 runtime
 tests, and 27 Terraform tests pass. The real server build/startup, PostgreSQL
-integration tests, and direct container test are in hosted CI; they could not
-run locally because Docker Desktop's image store returns I/O errors, including
-when listing images. The latest autoreview found that command mode set PATH and
-LD_LIBRARY_PATH to `/usr/local` but did not bind that directory into the
-Bubblewrap view. Command mode now mounts it read-only and has a regression
-assertion. Follow-up autoreview completed clean for P0–P2 at 2026-11-09 12:54
-UTC; the GitHub connector review is pending for the pushed candidate.
+tests, and direct container test are in hosted CI because Docker Desktop's local
+image store returns I/O errors, including when listing images. Hosted run
+42622842799 passed adapter, PostgreSQL recovery, server startup, and server
+image scanning, then failed the direct runtime test because the GitHub runner's
+outer seccomp policy denied Bubblewrap's user-namespace syscall. The smoke test
+now uses a test-only seccomp override and reports container exit state; no
+deployment security setting changed. The runtime image scan was not reached.
+
+Autoreview found and prompted fixes for the missing read-only `/usr/local`
+mount, command-stream timeout being shorter than valid command durations, and
+the hosted test's early port inspection. The command worker now mounts
+`/usr/local` read-only; the gateway derives its stream timeout from the command
+deadline up to the one-hour session cap; and the smoke test waits for port
+publication. Latest follow-up autoreview completed clean for P0–P2 at
+2026-11-09 13:23 UTC. GitHub connector review of the latest pushed candidate is
+pending.
 
 The customer image helper was adjusted so it builds OCI layouts, scans those
 exact layouts before publication, then copies the same digest and attestations
@@ -146,17 +157,13 @@ The tests do not constitute a new live Azure installation or deployment test.
 
 ## Image scan
 
-The most recent successful Trivy scans of the server and runtime image builds
-(before the latest runtime supervisor change) each reported zero Critical and
-47 High findings (11 unique IDs), with no fixed versions shown for those High
-findings. The latest candidate images could not be rebuilt or rescanned because
-Docker's image store returns I/O errors. The image build helper fails on
-Critical findings and reports High findings for review; it does not accept or
-waive them. The hosted proof workflow now prints High/Critical findings for the
-final candidate images and fails on Critical findings. Image-security
-acceptance remains open pending those scans and security-owner disposition of
-any unresolved High findings. Earlier scan JSON is in local temporary storage
-and is not committed.
+The latest hosted server image scan (run 42622842799) reported zero Critical
+and 47 High findings. The run failed before scanning the runtime image because
+the runner blocked Bubblewrap's user namespace; that test-only runner setting
+has now been adjusted, and the next run will scan both images. The hosted proof
+workflow prints High/Critical findings and fails on any Critical finding. The
+High findings are not waived. Image-security acceptance remains open pending
+the runtime scan and security-owner disposition of the 47 High findings.
 
 No Azure images were published, Terraform was not applied to a subscription, and
 the previous Azure setup was not recreated during this validation.

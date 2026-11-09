@@ -7,6 +7,7 @@ workspace-only filesystem boundary, including for direct API requests.
 
 import http.client
 import json
+import math
 import os
 import posixpath
 import subprocess
@@ -19,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 MAX_BODY = 33 * 1024 * 1024
+DEFAULT_REQUEST_TIMEOUT = 120
+MAX_COMMAND_STREAM_TIMEOUT = 3600
 command = files = None
 
 
@@ -101,6 +104,28 @@ def validate_file_request(method, path, query, content_type, body):
             raise ValueError("file upload path metadata is required")
 
 
+def request_timeout(method, path, body):
+    if method != "POST" or path != "/command":
+        return DEFAULT_REQUEST_TIMEOUT
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return DEFAULT_REQUEST_TIMEOUT
+    if not isinstance(payload, dict):
+        return DEFAULT_REQUEST_TIMEOUT
+    timeout_ms = payload.get("timeout")
+    if (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, (int, float))
+        or timeout_ms <= 0
+    ):
+        return MAX_COMMAND_STREAM_TIMEOUT
+    return min(
+        MAX_COMMAND_STREAM_TIMEOUT,
+        max(DEFAULT_REQUEST_TIMEOUT, math.ceil(timeout_ms / 1000) + 30),
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
@@ -144,7 +169,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "file paths must stay inside /workspace")
                 return
             for index, port in enumerate(ports):
-                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", port, timeout=request_timeout(self.command, path, body)
+                )
                 try:
                     connection.request(
                         self.command, self.path, body=body, headers=headers
