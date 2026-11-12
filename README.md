@@ -686,6 +686,16 @@ before continuing. It must remove the runtime identity's grant on the
 application registry and grant read access only on the new registry. Never
 move unrelated application images into the runtime registry.
 
+If Azure leaves a preview pool update stuck in progress, first confirm it has no
+allocated sessions and let the current Terraform command exit cleanly. Set a new
+unique `opensandbox_pool_name` and review a normal plan. Terraform creates the
+replacement before retiring the old pool and retains any pending deletion in
+state. Both pools can incur charges during this transition. Retry the normal
+apply after Azure releases the old operation, and verify the old pool is gone.
+Do not remove its state entry to bypass an Azure operation lock. A forced pool
+replacement also needs a new name because Azure cannot create two pools with
+the same name.
+
 For an existing active OpsRabbit installation, reconcile its sandbox image
 setting through the administrator workflow as part of the migration. Bootstrap
 stops on a conflicting active configuration instead of silently overwriting it.

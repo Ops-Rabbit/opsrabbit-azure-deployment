@@ -155,6 +155,8 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
   tags = var.tags
 
   lifecycle {
+    create_before_destroy = true
+
     precondition {
       condition     = var.opensandbox_runtime_image_digest != null
       error_message = "Set opensandbox_runtime_image_digest to the reviewed immutable ACR runtime image before enabling the application."
