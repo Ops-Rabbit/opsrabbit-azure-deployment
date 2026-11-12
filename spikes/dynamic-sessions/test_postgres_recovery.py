@@ -291,6 +291,44 @@ class PostgresRecoveryTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_idle_controller_does_not_block_application_online_index(self):
+        with psycopg.connect(
+            os.environ["AZURE_SESSION_TEST_ADMIN_URL"], autocommit=True
+        ) as admin:
+            admin.execute("CREATE TABLE public.controller_index_probe (value TEXT)")
+            admin.execute("INSERT INTO public.controller_index_probe VALUES ('probe')")
+            service = self.service()
+            follower = None
+            try:
+                # Exercise the same read-only heartbeat as the live controller.
+                with patch.object(service.shutdown, "wait", side_effect=[False, True]):
+                    service._leadership_loop()
+                follower = self.service()
+                self.assertFalse(follower.leader_ready)
+                for controller in (service, follower):
+                    state = admin.execute(
+                        "SELECT state FROM pg_stat_activity WHERE pid=%s",
+                        (controller.db.info.backend_pid,),
+                    ).fetchone()[0]
+                    self.assertEqual(state, "idle")
+                admin.execute("SET statement_timeout = '5s'")
+                admin.execute(
+                    "CREATE INDEX CONCURRENTLY controller_index_probe_idx "
+                    "ON public.controller_index_probe ((lower(value)))"
+                )
+                valid = admin.execute(
+                    "SELECT indisvalid FROM pg_index "
+                    "WHERE indexrelid='public.controller_index_probe_idx'::regclass"
+                ).fetchone()[0]
+                self.assertTrue(valid)
+                # Autocommit must not release the leader's session-level fence.
+                self.assertFalse(follower._try_become_leader())
+            finally:
+                if follower is not None:
+                    follower.close()
+                service.close()
+                admin.execute("DROP TABLE public.controller_index_probe")
+
 
 if __name__ == "__main__":
     unittest.main()

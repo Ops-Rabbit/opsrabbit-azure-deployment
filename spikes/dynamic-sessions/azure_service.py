@@ -111,7 +111,13 @@ class AzureSandboxService(SandboxService, ExtensionService):
         if self.postgres:
             import psycopg
 
-            self.db = psycopg.connect(os.environ["AZURE_SESSION_DATABASE_URL"])
+            # Journal transitions are single statements under self.lock. Keep
+            # reads and heartbeat probes out of idle transactions, which can
+            # block concurrent index migrations in the application schema.
+            # The session-level advisory lock survives statement commits.
+            self.db = psycopg.connect(
+                os.environ["AZURE_SESSION_DATABASE_URL"], autocommit=True
+            )
             self.table = "opensandbox.sessions"
         else:
             import sqlite3
