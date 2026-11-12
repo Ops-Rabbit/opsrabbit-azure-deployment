@@ -16,7 +16,7 @@ trap 'rm -rf "$metadata_dir"' EXIT
 command -v az >/dev/null || { echo "Azure CLI is required." >&2; exit 1; }
 command -v docker >/dev/null || { echo "Docker is required." >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required to read BuildKit image metadata." >&2; exit 1; }
-command -v trivy >/dev/null || { echo "Trivy is required for the critical-severity image gate." >&2; exit 1; }
+command -v trivy >/dev/null || { echo "Trivy is required for the High/Critical image gate." >&2; exit 1; }
 command -v skopeo >/dev/null || { echo "Skopeo is required to publish the scanned OCI image and attestations." >&2; exit 1; }
 docker buildx inspect >/dev/null
 az acr login --name "$registry_name" >/dev/null
@@ -36,7 +36,7 @@ docker buildx build \
   "$script_dir"
 
 trivy image --input "$runtime_layout" --severity HIGH,CRITICAL --format table
-trivy image --input "$runtime_layout" --exit-code 1 --severity CRITICAL
+trivy image --input "$runtime_layout" --exit-code 1 --severity HIGH,CRITICAL
 skopeo copy --all --preserve-digests "oci:${runtime_layout}:${tag}" "docker://${runtime_image}"
 
 docker buildx build \
@@ -49,7 +49,7 @@ docker buildx build \
   "$script_dir"
 
 trivy image --input "$server_layout" --severity HIGH,CRITICAL --format table
-trivy image --input "$server_layout" --exit-code 1 --severity CRITICAL
+trivy image --input "$server_layout" --exit-code 1 --severity HIGH,CRITICAL
 skopeo copy --all --preserve-digests "oci:${server_layout}:${tag}" "docker://${server_image}"
 
 runtime_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' "${metadata_dir}/runtime.json")"

@@ -81,6 +81,25 @@ python3 spikes/dynamic-sessions/test-server-startup.py opensandbox-azure-proof:t
 
 The customer image publication helper also requires Skopeo; it scans the OCI
 layout before copying the image and attestations to ACR.
+Both CI and publication reject High and Critical vulnerabilities, including
+findings without a vendor fix. No vulnerability exclusions are applied.
+
+The final server and runtime layers use digest-pinned Python on Alpine 3.24.
+The server installs the checksum-pinned OpenSandbox 1.1.1 wheel and the hashed
+transitive lock in `requirements-server.txt`; narrow Azure patches still fail
+the build if the expected upstream interfaces change. To refresh the lock:
+
+```sh
+uv pip compile spikes/dynamic-sessions/requirements-server.in \
+  --python-version 3.12 --python-platform x86_64-unknown-linux-musl \
+  --generate-hashes --output-file spikes/dynamic-sessions/requirements-server.txt
+```
+
+Alpine uses musl rather than glibc. The runtime includes Bash, GNU coreutils,
+Python and the static execd binary. Arbitrary glibc-only executables are not
+qualified for this image. The command worker's restricted `/usr` view includes
+copies of Alpine's `/bin` and `/lib` files; the original package files and
+package database remain intact for scanning and maintenance.
 
 CI runs the contract tests and real upstream startup/authentication checks without
 Azure credentials or provisioning cloud resources.
@@ -167,14 +186,12 @@ cleanup check fails.
 - The minimal runtime, denied egress and fixed image cannot satisfy all
   OpsRabbit tool workloads. Browser execution, sustained concurrency,
   customer-network acceptance and multi-replica coordination remain unsupported.
-- The latest completed server scan reported zero Critical and 47 High findings.
-  The current runtime image scan is pending; review its results before accepting
-  either image for production.
-  This is not image-security acceptance. Review the findings against an approved
-  risk policy or update the base/dependency versions before customer release.
-- Building this proof uses pinned top-level Python packages, but a full hashed
-  transitive dependency lock and a centrally managed release image pipeline
-  remain necessary.
+- Historical Debian images reported 47 High findings each. New images must pass
+  the High/Critical gate; download the exact commit's JSON scan artifacts from
+  the Azure OpenSandbox proof workflow before release. A scan result does not
+  replace live Azure qualification of a changed runtime base.
+- A centrally managed release image pipeline remains necessary; the current
+  helper builds, scans and publishes to the customer's ACR.
 
 Keep this test setup running for the requested walkthrough. Individual sessions
 remain ephemeral. Warm capacity, Container Apps and retained registry storage can

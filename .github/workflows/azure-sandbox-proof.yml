@@ -61,12 +61,13 @@ jobs:
           cache: false
           severity: HIGH,CRITICAL
           exit-code: "0"
-      - name: Block Critical runtime image vulnerabilities
+      - name: Block High and Critical runtime image vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: opensandbox-azure-runtime:ci
           format: table
-          severity: CRITICAL
+          cache: false
+          severity: HIGH,CRITICAL
           exit-code: "1"
       - name: Report server image vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -77,12 +78,13 @@ jobs:
           cache: false
           severity: HIGH,CRITICAL
           exit-code: "0"
-      - name: Block Critical server image vulnerabilities
+      - name: Block High and Critical server image vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: opensandbox-azure-proof:ci
           format: table
-          severity: CRITICAL
+          cache: false
+          severity: HIGH,CRITICAL
           exit-code: "1"
       - name: Verify direct command isolation and generated-file download
         run: python3 spikes/dynamic-sessions/test-runtime-container.py opensandbox-azure-runtime:ci

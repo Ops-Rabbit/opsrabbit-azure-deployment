@@ -502,13 +502,14 @@ spikes/dynamic-sessions/build-azure-images.sh \
 
 The helper attaches BuildKit SBOM and provenance attestations, pushes amd64
 images to the customer ACR, prints immutable digests for Terraform, scans both
-images with Trivy before publishing, and fails on Critical findings. Skopeo is
-required to publish the scanned OCI layouts with their attestations. Review every High finding;
-a passing Critical gate does not accept or remove High findings. The current
-latest server scan reported zero Critical and 47 High findings. The current
-runtime image scan is pending. This remains a security acceptance gate for
-customer release; do not
-represent it as a clean scan or silently waive findings. Terraform state
+images with Trivy before publishing, and fails on High or Critical findings,
+including findings without a vendor fix. Skopeo is required to publish the
+scanned OCI layouts with their attestations. Both final image layers use
+digest-pinned Python on Alpine 3.24; the OpenSandbox server dependency tree is
+hash-locked. Review the exact commit's JSON image scan artifacts in CI and
+qualify the final image digests on Azure before customer release. The minimal
+runtime supports command/file execution; arbitrary glibc-only binaries and
+browser automation are not qualified. Terraform state
 contains the generated OpenSandbox API key and restricted database password,
 so use encrypted remote state with limited access.
 
