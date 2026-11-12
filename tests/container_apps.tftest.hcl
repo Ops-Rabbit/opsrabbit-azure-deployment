@@ -328,12 +328,20 @@ run "complete_public_aca_topology" {
       contains(azapi_resource.opensandbox[0].identity[0].identity_ids, azurerm_user_assigned_identity.opensandbox[0].id) &&
       contains(azapi_resource.opensandbox[0].identity[0].identity_ids, azurerm_user_assigned_identity.opensandbox_server_pull[0].id) &&
       azapi_resource.opensandbox[0].body.properties.configuration.registries[0].identity == azurerm_user_assigned_identity.opensandbox_server_pull[0].id &&
-      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].identity == azurerm_user_assigned_identity.opensandbox[0].id &&
-      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].identity == azurerm_user_assigned_identity.opensandbox_server_pull[0].id &&
+      lower(azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].identity) == lower(azurerm_user_assigned_identity.opensandbox[0].id) &&
+      lower(azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].identity) == lower(azurerm_user_assigned_identity.opensandbox_server_pull[0].id) &&
       azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].lifecycle == "Main" &&
       azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].lifecycle == "None"
     )
     error_message = "The controller must use its executor identity at runtime while the server image-pull identity is unavailable to app code."
+  }
+
+  assert {
+    condition = (
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].identity == "/subscriptions/00000000-0000-0000-0000-000000000001/resourcegroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox-runtime-pull" &&
+      azapi_resource.opensandbox[0].body.properties.configuration.ingress.transport == "Auto"
+    )
+    error_message = "Match Azure's observed identity and transport casing while retaining transport drift detection."
   }
 
   assert {

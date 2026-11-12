@@ -146,7 +146,9 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
       }
       sessionNetworkConfiguration = { status = "EgressDisabled" }
       managedIdentitySettings = [{
-        identity  = azurerm_user_assigned_identity.opensandbox_runtime_pull[0].id
+        # Azure canonicalizes this path segment on read-back. Match it without
+        # ignoring changes to identity selection, lifecycle, or image values.
+        identity  = replace(azurerm_user_assigned_identity.opensandbox_runtime_pull[0].id, "/[/]resourceGroups[/]/", "/resourcegroups/")
         lifecycle = "None"
       }]
     }
@@ -205,11 +207,11 @@ resource "azapi_resource" "opensandbox" {
         activeRevisionsMode = "Single"
         identitySettings = [
           {
-            identity  = azurerm_user_assigned_identity.opensandbox[0].id
+            identity  = replace(azurerm_user_assigned_identity.opensandbox[0].id, "/[/]resourceGroups[/]/", "/resourcegroups/")
             lifecycle = "Main"
           },
           {
-            identity  = azurerm_user_assigned_identity.opensandbox_server_pull[0].id
+            identity  = replace(azurerm_user_assigned_identity.opensandbox_server_pull[0].id, "/[/]resourceGroups[/]/", "/resourcegroups/")
             lifecycle = "None"
           },
         ]
@@ -217,7 +219,8 @@ resource "azapi_resource" "opensandbox" {
           external      = true
           allowInsecure = false
           targetPort    = 8080
-          transport     = "auto"
+          # Keep transport managed, using Azure's canonical read-back casing.
+          transport = "Auto"
           traffic = [{
             latestRevision = true
             weight         = 100
