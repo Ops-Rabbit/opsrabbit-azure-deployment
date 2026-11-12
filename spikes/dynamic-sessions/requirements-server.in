@@ -1,0 +1,5 @@
+opensandbox-server @ https://files.pythonhosted.org/packages/80/d3/827a3751952a5d30d1d26160fb1b3bbeee24e12d6ae1d4b641d3abf822a2/opensandbox_server-1.1.1-py3-none-any.whl#sha256=7da042ecd5cfdd38bd8a96ca92d28d02bd91af2c26e5250382dd7a21c4bf04b8
+azure-identity==1.25.1
+certifi==2026.10.23
+oauthlib==4.0.1
+psycopg[binary]==3.3.8

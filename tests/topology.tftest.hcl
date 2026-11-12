@@ -1,11 +1,14 @@
 mock_provider "azurerm" {}
 mock_provider "postgresql" {}
+mock_provider "azapi" {}
+mock_provider "time" {}
 
 variables {
   subscription_id                   = "00000000-0000-0000-0000-000000000001"
   location                          = "eastus2"
   resource_group_name               = "rg-opsrabbit-test"
   container_registry_name           = "opsrabbittestacr"
+  opensandbox_runtime_registry_name = "opsrabbittestruntime"
   storage_account_name              = "opsrabbitteststorage"
   postgresql_server_name            = "pg-opsrabbit-test"
   postgresql_administrator_password = "test postgres+password"
@@ -15,6 +18,8 @@ variables {
   dns_name_label                    = "opsrabbit-test"
   backend_image_digest              = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   web_image_digest                  = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  opensandbox_server_image_digest   = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  opensandbox_runtime_image_digest  = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   better_auth_secret                = "test-better-auth-secret-at-least-32-characters"
   opsrabbit_encryption_key          = "test-opsrabbit-encryption-key-at-least-32-characters"
 }
@@ -37,12 +42,48 @@ override_resource {
 }
 
 override_resource {
+  target          = azurerm_container_registry.opensandbox_runtime
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestruntime"
+    login_server = "opsrabbittestruntime.azurecr.io"
+  }
+}
+
+override_resource {
   target          = azurerm_user_assigned_identity.aci_pull
   override_during = plan
   values = {
     id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test"
     client_id    = "00000000-0000-0000-0000-000000000003"
     principal_id = "00000000-0000-0000-0000-000000000002"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test-sandbox"
+    principal_id = "00000000-0000-0000-0000-000000000010"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_server_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test-sandbox-server-pull"
+    principal_id = "00000000-0000-0000-0000-000000000011"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_runtime_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-aci-test-sandbox-runtime-pull"
+    principal_id = "00000000-0000-0000-0000-000000000012"
   }
 }
 
@@ -102,8 +143,8 @@ run "bootstrap_without_container_group" {
   }
 
   assert {
-    condition     = azurerm_postgresql_flexible_server_configuration.extensions.value == "VECTOR"
-    error_message = "The Azure PostgreSQL server must allow the vector extension."
+    condition     = azurerm_postgresql_flexible_server_configuration.extensions.value == "VECTOR,PG_TRGM"
+    error_message = "The Azure PostgreSQL server must allow vector and pg_trgm for application migrations."
   }
 
   assert {
@@ -155,6 +196,49 @@ run "complete_application_topology" {
   assert {
     condition     = length(azurerm_container_group.opsrabbit[0].container) == 2
     error_message = "The ACI group must contain only the backend and web containers."
+  }
+
+  assert {
+    condition     = length(azurerm_container_group.opsrabbit[0].init_container) == 1 && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "initialize-opensandbox.js --install")
+    error_message = "Every fresh ACI deployment must run the verified OpenSandbox bootstrap before starting the app."
+  }
+
+  assert {
+    condition     = strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "--capabilities") && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "c.resourceLimits===true")
+    error_message = "ACI bootstrap must reject backend images without the verified-install contract."
+  }
+
+  assert {
+    condition = (
+      azurerm_container_group.opsrabbit[0].init_container[0].secure_environment_variables["BETTER_AUTH_SECRET"] == var.better_auth_secret &&
+      !contains(keys(azurerm_container_group.opsrabbit[0].init_container[0].environment_variables), "BETTER_AUTH_SECRET")
+    )
+    error_message = "The production bootstrap CLI requires the existing auth secret only in secure ACI environment variables."
+  }
+
+  assert {
+    condition     = azurerm_container_group.opsrabbit[0].init_container[0].environment_variables["OPENSANDBOX_BOOTSTRAP_REVISION"] == local.opensandbox_bootstrap_revision
+    error_message = "ACI must rerun verify-before-enable bootstrap when OpenSandbox server/runtime digests or session capacity change."
+  }
+
+  assert {
+    condition     = azapi_resource.opensandbox_pool_image_pull[0].body.properties.sessionNetworkConfiguration.status == "EgressDisabled" && azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None" && azurerm_role_assignment.opensandbox_session_executor[0].role_definition_name == "Azure ContainerApps Session Executor" && postgresql_schema.opensandbox[0].drop_cascade
+    error_message = "The fixed session pool must deny egress, withhold runtime identity and scope Session Executor to this pool."
+  }
+
+  assert {
+    condition = (
+      azapi_update_resource.acr_repository_mode.body.properties.roleAssignmentMode == "AbacRepositoryPermissions" &&
+      azurerm_role_assignment.acr_pull.role_definition_name == "AcrPull" &&
+      azurerm_role_assignment.acr_repository_reader.role_definition_name == "Container Registry Repository Reader" &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "registries/repositories:name") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/backend-aci") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/web") &&
+      time_sleep.acr_role_propagation.create_duration == "5m" &&
+      time_sleep.acr_role_propagation.triggers.opensandbox_server_acl == local.acr_opensandbox_server_reader_condition &&
+      azurerm_role_assignment.opensandbox_session_executor[0].principal_id != azurerm_role_assignment.opensandbox_acr_pull[0].principal_id
+    )
+    error_message = "ACI image access must keep pull access during the ABAC transition and scope the new identity grant to its repositories."
   }
 
   assert {
@@ -220,6 +304,58 @@ run "use_existing_resource_group" {
 run "private_application_topology" {
   command = plan
 
+  assert {
+    condition = (
+      azurerm_container_registry.opensandbox_runtime.sku == "Premium" &&
+      !azurerm_container_registry.opensandbox_runtime.public_network_access_enabled &&
+      length(azurerm_private_endpoint.opensandbox_runtime_registry) == 1 &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_service_connection[0].private_connection_resource_id == azurerm_container_registry.opensandbox_runtime.id &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_dns_zone_group[0].private_dns_zone_ids == tolist([var.private_network.acr_private_dns_zone_id])
+    )
+    error_message = "Private deployments must give the separate runtime registry its own private endpoint and DNS records."
+  }
+
+
+  override_resource {
+    target          = azurerm_private_dns_zone.opensandbox_environment[0]
+    override_during = plan
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.Network/privateDnsZones/test.eastus2.azurecontainerapps.io"
+    }
+  }
+
+  override_resource {
+    target          = azurerm_container_app_environment.opsrabbit[0]
+    override_during = plan
+    values = {
+      id                = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/managedEnvironments/cae-opsrabbit-test"
+      default_domain    = "test.eastus2.azurecontainerapps.io"
+      static_ip_address = "10.20.3.10"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_subnet.private["sessions"]
+    values = {
+      address_prefixes = ["10.20.3.0/27"]
+    }
+  }
+
+  override_data {
+    target = data.azapi_resource.container_apps_subnet["sessions"]
+    values = {
+      output = {
+        properties = {
+          delegations = [{
+            properties = {
+              serviceName = "Microsoft.App/environments"
+            }
+          }]
+        }
+      }
+    }
+  }
+
   override_data {
     target = data.azurerm_subnet.private["compute"]
     values = {
@@ -240,6 +376,14 @@ run "private_application_topology" {
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
     values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
+    values = {
+      id       = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer"
       location = "eastus2"
     }
   }
@@ -274,6 +418,7 @@ run "private_application_topology" {
     container_group_enabled    = true
     private_network = {
       aci_subnet_id                  = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer/subnets/snet-aci"
+      container_apps_subnet_id       = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer/subnets/snet-container-apps"
       postgresql_subnet_id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer/subnets/snet-postgresql"
       private_endpoint_subnet_id     = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer/subnets/snet-private-endpoints"
       acr_private_dns_zone_id        = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/privateDnsZones/privatelink.azurecr.io"
@@ -316,6 +461,31 @@ run "private_application_topology" {
   assert {
     condition     = azurerm_container_group.opsrabbit[0].ip_address_type == "Private" && azurerm_container_group.opsrabbit[0].dns_name_label == null && contains(azurerm_container_group.opsrabbit[0].subnet_ids, var.private_network.aci_subnet_id)
     error_message = "Private ACI must use a private IP in the supplied delegated subnet without a public DNS label."
+  }
+
+  assert {
+    condition     = azapi_resource.opensandbox[0].body.properties.configuration.ingress.external
+    error_message = "Private ACI must reach OpenSandbox through the internal ACA environment load balancer."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_zone.opensandbox_environment[0].name == azurerm_container_app_environment.opsrabbit[0].default_domain
+    error_message = "Private ACI DNS zone must use the internal ACA environment's generated domain."
+  }
+
+  assert {
+    condition     = length(azurerm_private_dns_a_record.opensandbox_environment[0].records) == 1 && contains(azurerm_private_dns_a_record.opensandbox_environment[0].records, azurerm_container_app_environment.opsrabbit[0].static_ip_address)
+    error_message = "Private ACI bootstrap must resolve through an A record for the internal ACA environment IP."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_a_record.opensandbox_environment[0].private_dns_zone_id == azurerm_private_dns_zone.opensandbox_environment[0].id && azurerm_private_dns_zone_virtual_network_link.opensandbox_environment[0].private_dns_zone_id == azurerm_private_dns_zone.opensandbox_environment[0].id
+    error_message = "Private ACI DNS records and VNet link must reference the managed environment zone."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_zone_virtual_network_link.opensandbox_environment[0].virtual_network_id == data.azurerm_virtual_network.private["sessions"].id
+    error_message = "Private ACA DNS zone must link to the customer VNet."
   }
 
   assert {

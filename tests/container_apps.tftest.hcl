@@ -2,12 +2,14 @@ mock_provider "azurerm" {}
 mock_provider "azapi" {}
 mock_provider "postgresql" {}
 mock_provider "random" {}
+mock_provider "time" {}
 
 variables {
   subscription_id                   = "00000000-0000-0000-0000-000000000001"
   location                          = "eastus2"
   resource_group_name               = "rg-opsrabbit-test"
   container_registry_name           = "opsrabbittestacr"
+  opensandbox_runtime_registry_name = "opsrabbittestruntime"
   storage_account_name              = "opsrabbitteststorage"
   postgresql_server_name            = "pg-opsrabbit-test"
   postgresql_administrator_password = join("", [for _ in range(16) : "p"])
@@ -19,6 +21,8 @@ variables {
   container_app_name                = "ca-opsrabbit-test"
   backend_image_digest              = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   web_image_digest                  = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  opensandbox_server_image_digest   = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  opensandbox_runtime_image_digest  = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   better_auth_secret                = join("", [for _ in range(32) : "a"])
   opsrabbit_encryption_key          = join("", [for _ in range(32) : "e"])
 }
@@ -37,6 +41,15 @@ override_resource {
   values = {
     id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestacr"
     login_server = "opsrabbittestacr.azurecr.io"
+  }
+}
+
+override_resource {
+  target          = azurerm_container_registry.opensandbox_runtime
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestruntime"
+    login_server = "opsrabbittestruntime.azurecr.io"
   }
 }
 
@@ -72,8 +85,9 @@ override_resource {
   target          = azurerm_container_app_environment.opsrabbit[0]
   override_during = plan
   values = {
-    id             = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/managedEnvironments/cae-opsrabbit-test"
-    default_domain = "test.eastus2.azurecontainerapps.io"
+    id                = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/managedEnvironments/cae-opsrabbit-test"
+    default_domain    = "test.eastus2.azurecontainerapps.io"
+    static_ip_address = "10.20.0.5"
   }
 }
 
@@ -89,10 +103,56 @@ override_resource {
 }
 
 override_resource {
+  target          = azapi_resource.opensandbox[0]
+  override_during = plan
+  values = {
+    id = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/containerApps/ca-opensandbox"
+    ingress = {
+      fqdn = "ca-opsrabbit-sandbox.test.eastus2.azurecontainerapps.io"
+    }
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox"
+    principal_id = "00000000-0000-0000-0000-000000000010"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_server_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox-server-pull"
+    principal_id = "00000000-0000-0000-0000-000000000011"
+  }
+}
+
+override_resource {
+  target          = azurerm_user_assigned_identity.opensandbox_runtime_pull[0]
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox-runtime-pull"
+    principal_id = "00000000-0000-0000-0000-000000000012"
+  }
+}
+
+override_resource {
   target          = random_id.container_app_revision[0]
   override_during = plan
   values = {
     hex = "abcd1234"
+  }
+}
+
+override_resource {
+  target          = random_id.opensandbox_credential_revision[0]
+  override_during = plan
+  values = {
+    hex = "ef901234"
   }
 }
 
@@ -187,7 +247,13 @@ run "complete_public_aca_topology" {
   assert {
     condition = (
       azurerm_container_app.opsrabbit[0].template[0].revision_suffix != random_id.container_app_revision[0].hex &&
-      length(random_id.container_app_revision[0].keepers) == 1 &&
+      length(random_id.container_app_revision[0].keepers) == 2 &&
+      random_id.container_app_revision[0].keepers.opensandbox_bootstrap == sha512(jsonencode([
+        local.opensandbox_controller_origin,
+        var.opensandbox_server_image_digest,
+        local.opensandbox_runtime_image,
+        var.opensandbox_max_sessions,
+      ])) &&
       length([
         for setting in azurerm_container_app.opsrabbit[0].template[0].container[0].env : setting
         if setting.name == "OPSRABBIT_SECRET_GENERATION" && setting.value == random_id.container_app_revision[0].hex
@@ -199,6 +265,83 @@ run "complete_public_aca_topology" {
   assert {
     condition     = length(azurerm_container_app.opsrabbit[0].template[0].container) == 2
     error_message = "The Container App must contain only the backend and web containers."
+  }
+
+  assert {
+    condition     = length(azurerm_container_app.opsrabbit[0].template[0].init_container) == 1 && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "initialize-opensandbox.js --install")
+    error_message = "Every fresh ACA deployment must verify and initialize OpenSandbox before the application starts."
+  }
+
+  assert {
+    condition     = strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "--capabilities") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "c.resourceLimits===true")
+    error_message = "ACA bootstrap must reject backend images without the verified-install contract."
+  }
+
+  assert {
+    condition = length([
+      for env in azurerm_container_app.opsrabbit[0].template[0].init_container[0].env : env
+      if env.name == "BETTER_AUTH_SECRET" && env.secret_name == "better-auth-secret" && (env.value == null || env.value == "")
+    ]) == 1
+    error_message = "The production bootstrap CLI requires the existing auth secret through an ACA secret reference."
+  }
+
+  assert {
+    condition = length([
+      for setting in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : setting
+      if setting.name == "OPENSANDBOX_CREDENTIAL_GENERATION" && setting.value == random_id.opensandbox_credential_revision[0].hex
+    ]) == 1
+    error_message = "ACA controller credential rotations must create a new revision."
+  }
+
+  assert {
+    condition     = azapi_resource.opensandbox_pool_image_pull[0].body.properties.sessionNetworkConfiguration.status == "EgressDisabled" && azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None" && azurerm_role_assignment.opensandbox_session_executor[0].role_definition_name == "Azure ContainerApps Session Executor" && azapi_resource.opensandbox[0].body.properties.template.scale.maxReplicas == 1 && postgresql_schema.opensandbox[0].drop_cascade
+    error_message = "The ACA OpenSandbox topology must deny session egress, keep identity out of workloads, scope controller permissions and run one controller replica."
+  }
+
+  assert {
+    condition = (
+      azapi_update_resource.acr_repository_mode.body.properties.roleAssignmentMode == "AbacRepositoryPermissions" &&
+      azurerm_role_assignment.acr_pull.role_definition_name == "AcrPull" &&
+      azurerm_role_assignment.acr_repository_reader.role_definition_name == "Container Registry Repository Reader" &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "registries/repositories:name") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/backend") &&
+      strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/web") &&
+      time_sleep.acr_role_propagation.create_duration == "5m" &&
+      time_sleep.acr_role_propagation.triggers.opensandbox_runtime_registry == azurerm_container_registry.opensandbox_runtime.id
+    )
+    error_message = "ACR must retain legacy pull access until it has switched after assigning repository-scoped reader access."
+  }
+
+  assert {
+    condition = (
+      azurerm_role_assignment.opensandbox_acr_pull[0].principal_id == azurerm_user_assigned_identity.opensandbox_server_pull[0].principal_id &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].principal_id == azurerm_user_assigned_identity.opensandbox_runtime_pull[0].principal_id &&
+      azurerm_role_assignment.opensandbox_session_executor[0].principal_id == azurerm_user_assigned_identity.opensandbox[0].principal_id &&
+      azurerm_user_assigned_identity.opensandbox[0].principal_id != azurerm_user_assigned_identity.opensandbox_server_pull[0].principal_id &&
+      azurerm_user_assigned_identity.opensandbox[0].principal_id != azurerm_user_assigned_identity.opensandbox_runtime_pull[0].principal_id
+    )
+    error_message = "The controller executor, server image pull, and runtime image pull must use separate identities."
+  }
+
+  assert {
+    condition = (
+      contains(azapi_resource.opensandbox[0].identity[0].identity_ids, azurerm_user_assigned_identity.opensandbox[0].id) &&
+      contains(azapi_resource.opensandbox[0].identity[0].identity_ids, azurerm_user_assigned_identity.opensandbox_server_pull[0].id) &&
+      azapi_resource.opensandbox[0].body.properties.configuration.registries[0].identity == azurerm_user_assigned_identity.opensandbox_server_pull[0].id &&
+      lower(azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].identity) == lower(azurerm_user_assigned_identity.opensandbox[0].id) &&
+      lower(azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].identity) == lower(azurerm_user_assigned_identity.opensandbox_server_pull[0].id) &&
+      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[0].lifecycle == "Main" &&
+      azapi_resource.opensandbox[0].body.properties.configuration.identitySettings[1].lifecycle == "None"
+    )
+    error_message = "The controller must use its executor identity at runtime while the server image-pull identity is unavailable to app code."
+  }
+
+  assert {
+    condition = (
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].identity == "/subscriptions/00000000-0000-0000-0000-000000000001/resourcegroups/rg-opsrabbit-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-opsrabbit-pull-test-sandbox-runtime-pull" &&
+      azapi_resource.opensandbox[0].body.properties.configuration.ingress.transport == "Auto"
+    )
+    error_message = "Match Azure's observed identity and transport casing while retaining transport drift detection."
   }
 
   assert {
@@ -240,8 +383,28 @@ run "complete_public_aca_topology" {
 run "complete_private_aca_topology" {
   command = plan
 
+  assert {
+    condition = (
+      azurerm_container_registry.opensandbox_runtime.sku == "Premium" &&
+      !azurerm_container_registry.opensandbox_runtime.public_network_access_enabled &&
+      length(azurerm_private_endpoint.opensandbox_runtime_registry) == 1 &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_service_connection[0].private_connection_resource_id == azurerm_container_registry.opensandbox_runtime.id &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_dns_zone_group[0].private_dns_zone_ids == tolist([var.private_network.acr_private_dns_zone_id])
+    )
+    error_message = "Private deployments must give the separate runtime registry its own private endpoint and DNS records."
+  }
+
+
+  override_resource {
+    target          = azurerm_private_dns_zone.opensandbox_environment[0]
+    override_during = plan
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.Network/privateDnsZones/test.eastus2.azurecontainerapps.io"
+    }
+  }
+
   override_data {
-    target = data.azapi_resource.container_apps_subnet["compute"]
+    target = data.azapi_resource.container_apps_subnet["sessions"]
     values = {
       output = {
         properties = {
@@ -267,6 +430,13 @@ run "complete_private_aca_topology" {
   }
 
   override_data {
+    target = data.azurerm_subnet.private["sessions"]
+    values = {
+      address_prefixes = ["10.20.0.0/27"]
+    }
+  }
+
+  override_data {
     target = data.azurerm_subnet.private["postgresql"]
     values = {
       address_prefixes = ["10.20.1.0/28"]
@@ -276,6 +446,14 @@ run "complete_private_aca_topology" {
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
     values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
+    values = {
+      id       = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-customer"
       location = "eastus2"
     }
   }
@@ -313,6 +491,36 @@ run "complete_private_aca_topology" {
   assert {
     condition     = azurerm_container_app_environment.opsrabbit[0].infrastructure_subnet_id == var.private_network.container_apps_subnet_id && azurerm_container_app_environment.opsrabbit[0].internal_load_balancer_enabled && azurerm_container_app_environment.opsrabbit[0].public_network_access == "Disabled"
     error_message = "Private ACA must use the supplied infrastructure subnet and an internal managed environment."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_zone.opensandbox_environment[0].name == azurerm_container_app_environment.opsrabbit[0].default_domain
+    error_message = "Private ACA DNS zone must use the managed environment's generated domain."
+  }
+
+  assert {
+    condition     = azapi_resource.opensandbox[0].body.properties.configuration.ingress.external
+    error_message = "The OpenSandbox controller must be reachable from the internal ACA load balancer, including by private ACI."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_a_record.opensandbox_environment[0].name == "*"
+    error_message = "Private ACA DNS must use a wildcard A record."
+  }
+
+  assert {
+    condition     = length(azurerm_private_dns_a_record.opensandbox_environment[0].records) == 1 && contains(azurerm_private_dns_a_record.opensandbox_environment[0].records, azurerm_container_app_environment.opsrabbit[0].static_ip_address)
+    error_message = "Private ACA wildcard A record must point to the managed environment IP."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_a_record.opensandbox_environment[0].private_dns_zone_id == azurerm_private_dns_zone.opensandbox_environment[0].id && azurerm_private_dns_zone_virtual_network_link.opensandbox_environment[0].private_dns_zone_id == azurerm_private_dns_zone.opensandbox_environment[0].id
+    error_message = "Private ACA DNS records and VNet link must reference the managed environment zone."
+  }
+
+  assert {
+    condition     = azurerm_private_dns_zone_virtual_network_link.opensandbox_environment[0].virtual_network_id == data.azurerm_virtual_network.private["sessions"].id
+    error_message = "Private ACA DNS zone must link to the customer VNet."
   }
 
   assert {
@@ -357,7 +565,18 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
   command = plan
 
   override_data {
-    target = data.azapi_resource.container_apps_subnet["compute"]
+    target = data.azurerm_subnet.private["compute"]
+    values = {
+      address_prefixes = ["10.20.0.0/27"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
+    }
+  }
+
+  override_data {
+    target = data.azapi_resource.container_apps_subnet["sessions"]
     values = {
       output = {
         properties = {
@@ -372,7 +591,7 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
   }
 
   override_data {
-    target = data.azurerm_subnet.private["compute"]
+    target = data.azurerm_subnet.private["sessions"]
     values = {
       address_prefixes = ["10.20.0.0/28"]
       service_endpoint = [{
@@ -391,6 +610,13 @@ run "reject_private_aca_subnet_smaller_than_slash_27" {
 
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
+    values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
     values = {
       location = "eastus2"
     }
@@ -433,7 +659,18 @@ run "reject_private_aca_subnet_without_delegation" {
   command = plan
 
   override_data {
-    target = data.azapi_resource.container_apps_subnet["compute"]
+    target = data.azurerm_subnet.private["compute"]
+    values = {
+      address_prefixes = ["10.20.0.0/27"]
+      service_endpoint = [{
+        network_identifier = ""
+        service            = "Microsoft.Storage"
+      }]
+    }
+  }
+
+  override_data {
+    target = data.azapi_resource.container_apps_subnet["sessions"]
     values = {
       output = {
         properties = {
@@ -444,7 +681,7 @@ run "reject_private_aca_subnet_without_delegation" {
   }
 
   override_data {
-    target = data.azurerm_subnet.private["compute"]
+    target = data.azurerm_subnet.private["sessions"]
     values = {
       address_prefixes = ["10.20.0.0/27"]
       service_endpoint = [{
@@ -463,6 +700,13 @@ run "reject_private_aca_subnet_without_delegation" {
 
   override_data {
     target = data.azurerm_virtual_network.private["compute"]
+    values = {
+      location = "eastus2"
+    }
+  }
+
+  override_data {
+    target = data.azurerm_virtual_network.private["sessions"]
     values = {
       location = "eastus2"
     }
@@ -524,4 +768,106 @@ run "reject_unknown_deployment_target" {
   expect_failures = [
     var.deployment_target,
   ]
+}
+
+run "reject_fractional_opensandbox_session_limit" {
+  command = plan
+
+  variables {
+    opensandbox_max_sessions = 1.5
+  }
+
+  expect_failures = [
+    var.opensandbox_max_sessions,
+  ]
+}
+
+run "reject_invalid_opensandbox_controller_name" {
+  command = plan
+
+  variables {
+    opensandbox_controller_name = "ca--opensandbox"
+  }
+
+  expect_failures = [
+    var.opensandbox_controller_name,
+  ]
+}
+
+run "reject_invalid_container_app_name" {
+  command = plan
+
+  variables {
+    container_app_name = "ca--opsrabbit"
+  }
+
+  expect_failures = [
+    var.container_app_name,
+  ]
+}
+
+run "runtime_registry_access_boundary" {
+  command = plan
+  variables {
+    application_enabled = true
+  }
+  override_resource {
+    target          = random_password.opensandbox_api_key[0]
+    override_during = plan
+    values          = { result = "synthetic-runtime-registry-test-only" }
+  }
+  assert {
+    condition = (
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].scope == azurerm_container_registry.opensandbox_runtime.id &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].scope != azurerm_container_registry.opsrabbit.id &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].condition == null &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].role_definition_name == "Container Registry Repository Reader" &&
+      azurerm_role_assignment.opensandbox_acr_pull[0].scope == azurerm_container_registry.opsrabbit.id &&
+      azurerm_role_assignment.acr_repository_reader.scope == azurerm_container_registry.opsrabbit.id
+    )
+    error_message = "Runtime Reader access must be limited to the separate runtime registry, never the application registry."
+  }
+  assert {
+    condition = (
+      azurerm_container_registry.opensandbox_runtime.sku == "Basic" &&
+      azurerm_container_registry.opensandbox_runtime.role_assignment_mode == "AbacRepositoryPermissions" &&
+      !azurerm_container_registry.opensandbox_runtime.admin_enabled &&
+      !azurerm_container_registry.opensandbox_runtime.anonymous_pull_enabled &&
+      length(azurerm_private_endpoint.opensandbox_runtime_registry) == 0 &&
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None"
+    )
+    error_message = "Public QA runtime storage must remain authenticated, without exposing its identity to sandbox code."
+  }
+  assert {
+    condition = (
+      local.opensandbox_runtime_image == "opsrabbittestruntime.azurecr.io/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}" &&
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.customContainerTemplate.containers[0].image == local.opensandbox_runtime_image &&
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.customContainerTemplate.registryCredentials.server == azurerm_container_registry.opensandbox_runtime.login_server &&
+      jsondecode(local.opensandbox_bootstrap_json).image == local.opensandbox_runtime_image &&
+      jsondecode(local.opensandbox_bootstrap_json).resourceLimits.cpu == "0.5" &&
+      jsondecode(local.opensandbox_bootstrap_json).resourceLimits.memory == "1g" &&
+      one([for entry in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : entry.value if entry.name == "AZURE_SESSION_IMAGE"]) == local.opensandbox_runtime_image
+    )
+    error_message = "The pool, controller and product bootstrap must use the same immutable image in the runtime-only registry."
+  }
+}
+
+run "reject_shared_application_runtime_registry" {
+  command = plan
+  variables {
+    opensandbox_runtime_registry_name = "opsrabbittestacr"
+  }
+  expect_failures = [var.opensandbox_runtime_registry_name]
+}
+
+run "runtime_registry_default_handles_long_names" {
+  command = plan
+  variables {
+    container_registry_name           = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWX"
+    opensandbox_runtime_registry_name = null
+  }
+  assert {
+    condition     = can(regex("^[a-z0-9]{5,50}$", azurerm_container_registry.opensandbox_runtime.name)) && azurerm_container_registry.opensandbox_runtime.name != lower(var.container_registry_name)
+    error_message = "Derived runtime registry names must remain valid and distinct for maximum-length application registry names."
+  }
 }

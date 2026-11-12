@@ -1,10 +1,10 @@
 resource "azurerm_container_app_environment" "opsrabbit" {
-  count = var.deployment_target == "aca" ? 1 : 0
+  count = var.deployment_target == "aca" || local.opensandbox_enabled ? 1 : 0
 
   name                           = var.container_app_environment_name
   resource_group_name            = var.resource_group_name
   location                       = var.location
-  infrastructure_subnet_id       = local.private_network_enabled ? local.compute_subnet_id : null
+  infrastructure_subnet_id       = local.private_network_enabled ? var.private_network.container_apps_subnet_id : null
   internal_load_balancer_enabled = local.private_network_enabled ? true : null
   public_network_access          = local.private_network_enabled ? "Disabled" : "Enabled"
 
@@ -18,9 +18,9 @@ resource "azurerm_container_app_environment" "opsrabbit" {
   lifecycle {
     precondition {
       condition = !local.private_network_enabled || try(
-        length(data.azurerm_subnet.private["compute"].address_prefixes) > 0 &&
+        length(data.azurerm_subnet.private["sessions"].address_prefixes) > 0 &&
         alltrue([
-          for prefix in data.azurerm_subnet.private["compute"].address_prefixes :
+          for prefix in data.azurerm_subnet.private["sessions"].address_prefixes :
           can(cidrnetmask(prefix)) && tonumber(split("/", prefix)[1]) <= 27
         ]),
         false,
@@ -30,10 +30,10 @@ resource "azurerm_container_app_environment" "opsrabbit" {
 
     precondition {
       condition = !local.private_network_enabled || try(anytrue([
-        for delegation in data.azapi_resource.container_apps_subnet["compute"].output.properties.delegations :
+        for delegation in data.azapi_resource.container_apps_subnet["sessions"].output.properties.delegations :
         lower(delegation.properties.serviceName) == "microsoft.app/environments"
       ]), false)
-      error_message = "The private Azure Container Apps infrastructure subnet must be dedicated and delegated to Microsoft.App/environments."
+      error_message = "The private Azure Container Apps/OpenSandbox subnet must be dedicated and delegated to Microsoft.App/environments."
     }
   }
 
@@ -41,6 +41,36 @@ resource "azurerm_container_app_environment" "opsrabbit" {
     azurerm_resource_group.opsrabbit,
     data.azurerm_resource_group.existing,
   ]
+}
+
+# Internal ACA ingress is reachable from the application VNet only after its
+# generated environment suffix resolves to the environment's private IP.
+resource "azurerm_private_dns_zone" "opensandbox_environment" {
+  count = local.private_network_enabled && local.opensandbox_enabled ? 1 : 0
+
+  name                = azurerm_container_app_environment.opsrabbit[0].default_domain
+  resource_group_name = var.resource_group_name
+  tags                = var.tags
+}
+
+resource "azurerm_private_dns_a_record" "opensandbox_environment" {
+  count = local.private_network_enabled && local.opensandbox_enabled ? 1 : 0
+
+  name                = "*"
+  private_dns_zone_id = azurerm_private_dns_zone.opensandbox_environment[0].id
+  ttl                 = 300
+  records             = [azurerm_container_app_environment.opsrabbit[0].static_ip_address]
+  tags                = var.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "opensandbox_environment" {
+  count = local.private_network_enabled && local.opensandbox_enabled ? 1 : 0
+
+  name                 = "${var.container_app_environment_name}-opensandbox"
+  private_dns_zone_id  = azurerm_private_dns_zone.opensandbox_environment[0].id
+  virtual_network_id   = data.azurerm_virtual_network.private["sessions"].id
+  registration_enabled = false
+  tags                 = var.tags
 }
 
 resource "azurerm_container_app_environment_storage" "application_data" {
@@ -74,7 +104,15 @@ resource "random_id" "container_app_revision" {
       var.postgresql_administrator_password,
       var.better_auth_secret,
       var.opsrabbit_encryption_key,
+      try(random_password.opensandbox_api_key[0].result, null),
+      try(random_password.opensandbox_database[0].result, null),
     ]))
+    opensandbox_bootstrap = local.opensandbox_enabled ? sha512(jsonencode([
+      local.opensandbox_controller_origin,
+      var.opensandbox_server_image_digest,
+      local.opensandbox_runtime_image,
+      var.opensandbox_max_sessions,
+    ])) : "disabled"
   }
 }
 
@@ -112,6 +150,14 @@ resource "azurerm_container_app" "opsrabbit" {
     value = var.opsrabbit_encryption_key
   }
 
+  dynamic "secret" {
+    for_each = local.opensandbox_enabled ? [1] : []
+    content {
+      name  = "opensandbox-bootstrap-json"
+      value = local.opensandbox_bootstrap_json
+    }
+  }
+
   ingress {
     external_enabled           = true
     allow_insecure_connections = false
@@ -128,6 +174,42 @@ resource "azurerm_container_app" "opsrabbit" {
     min_replicas                     = 1
     max_replicas                     = 1
     termination_grace_period_seconds = 120
+
+    dynamic "init_container" {
+      for_each = local.opensandbox_enabled ? [1] : []
+      content {
+        name    = "sandbox-bootstrap"
+        image   = local.backend_image
+        cpu     = 0.5
+        memory  = "1Gi"
+        command = ["/bin/bash", "-lc"]
+        args    = [local.opensandbox_bootstrap_command]
+        env {
+          name  = "POSTGRES_HOST"
+          value = azurerm_postgresql_flexible_server.opsrabbit.fqdn
+        }
+        env {
+          name        = "OPSRABBIT_NODE_DATABASE_URL"
+          secret_name = "database-url"
+        }
+        env {
+          name        = "OPENSANDBOX_BOOTSTRAP_JSON"
+          secret_name = "opensandbox-bootstrap-json"
+        }
+        env {
+          name        = "OPSRABBIT_NODE_ENCRYPTION_KEY"
+          secret_name = "opsrabbit-encryption-key"
+        }
+        env {
+          name        = "BETTER_AUTH_SECRET"
+          secret_name = "better-auth-secret"
+        }
+        env {
+          name  = "NODE_ENV"
+          value = "production"
+        }
+      }
+    }
 
     container {
       name   = "backend"
@@ -329,6 +411,10 @@ resource "azurerm_container_app" "opsrabbit" {
 
   depends_on = [
     azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.acr_repository_reader,
+    time_sleep.acr_role_propagation,
+    azapi_update_resource.acr_repository_mode,
+    azapi_resource.opensandbox,
     azurerm_postgresql_flexible_server_firewall_rule.azure_services,
     azurerm_private_endpoint.container_registry,
     azurerm_container_app_environment_storage.application_data,
