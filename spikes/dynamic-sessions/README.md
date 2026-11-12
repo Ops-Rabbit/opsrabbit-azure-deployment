@@ -107,7 +107,15 @@ package database remain intact for scanning and maintenance.
 CI runs the contract tests and real upstream startup/authentication checks without
 Azure credentials or provisioning cloud resources.
 
-## Live proof deployment
+## Historical adapter proof deployment
+
+The steps below record the original standalone adapter experiment. They are not
+the current customer installation procedure: its repository-conditioned runtime
+pull grant did not work with the subsequently validated Dynamic Sessions API.
+For a new installation, follow the [root README](../../README.md), which provisions
+a dedicated runtime-only ACR, separate identities, durable controller storage,
+and automatic OpsRabbit configuration through Terraform. Use the verification
+command below against that installation's controller and runtime image outputs.
 
 Use a dedicated test resource group and retain exact resource names in a private
 inventory. Never put credentials or customer-specific resource IDs in this repo.
