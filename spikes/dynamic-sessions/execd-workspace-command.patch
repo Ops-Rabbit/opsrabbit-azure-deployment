@@ -1,0 +1,133 @@
+--- a/components/execd/pkg/runtime/command_argv.go
++++ b/components/execd/pkg/runtime/command_argv.go
+@@ -24,7 +24,6 @@
+ 	"runtime"
+ 	"strings"
+ 
+-	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
+ )
+ 
+ const goosWindows = "windows"
+@@ -37,34 +36,41 @@
+ 	return string(data)
+ }
+ 
+-// ValidateCommandWorkingDir validates cwd with request environment overrides.
+-func ValidateCommandWorkingDir(cwd string, envs map[string]string) error {
+-	if cwd == "" {
+-		return nil
+-	}
+-	return ValidateWorkingDirWithEnv(cwd, UserEnvOverlay(envs))
++// ValidateCommandWorkingDir never expands user environment in the supervisor.
++// Symlinks are resolved only when bwrap changes cwd inside the completed child root.
++func ValidateCommandWorkingDir(cwd string, _ map[string]string) error {
++ if cwd == "" { return nil }
++ if strings.ContainsRune(cwd, 0) || !filepath.IsAbs(cwd) {
++  return fmt.Errorf("command cwd must be an absolute workspace path")
++ }
++ clean := filepath.Clean(cwd)
++ if clean != "/workspace" && !strings.HasPrefix(clean, "/workspace/") {
++  return fmt.Errorf("command cwd must stay inside /workspace")
++ }
++ return nil
+ }
+ 
+-// prepareCommand shares cwd and environment between executable lookup and startup.
++// prepareCommand is the mandatory boundary for shell AND native argv launches,
++// foreground AND background. No request-controlled executable or environment is
++// ever used to start a process in the trusted supervisor's procfs namespace.
+ func prepareCommand(ctx context.Context, request *ExecuteCodeRequest) (*exec.Cmd, error) {
+-	// Layered with the /init RuntimeBinding as authority:
+-	// sandbox envs < EXECD_ENVS file < request envs.
+-	overrides := UserEnvOverlay(request.Envs)
+-	cwd, err := pathutil.ExpandPathWithEnv(request.Cwd, overrides)
+-	if err != nil {
+-		return nil, err
+-	}
+-	// Derive PWD from cwd before applying explicit overrides.
+-	env := mergeEnvs((&exec.Cmd{Dir: cwd}).Environ(), overrides)
+-	var cmd *exec.Cmd
+-	if request.Argv != nil {
+-		cmd = nativeCommand(ctx, request.Argv, cwd, env)
+-	} else {
+-		cmd = newShellCommand(ctx, request.Code)
+-	}
+-	cmd.Dir = cwd
+-	cmd.Env = env
+-	return cmd, nil
++ if request.Uid != nil || request.Gid != nil {
++  return nil, fmt.Errorf("workspace commands cannot change identity")
++ }
++ if err := ValidateCommandWorkingDir(request.Cwd, nil); err != nil { return nil, err }
++ envs := request.Envs
++ if envs == nil { envs = map[string]string{} }
++ payload, err := json.Marshal(struct {
++  Command string `json:"command"`
++  Argv []string `json:"argv"`
++  Cwd string `json:"cwd"`
++  Envs map[string]string `json:"envs"`
++ }{request.Code, request.Argv, request.Cwd, envs})
++ if err != nil { return nil, err }
++ cmd := exec.CommandContext(ctx, "/usr/local/bin/python", "-I", "-S", "/opt/workspace-command.py", string(payload))
++ cmd.Dir = "/"
++ cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "LD_LIBRARY_PATH=/usr/local/lib", "HOME=/workspace"}
++ return cmd, nil
+ }
+ 
+ // nativeCommand preserves lookup failures as command start errors.
+--- a/components/execd/pkg/runtime/types.go
++++ b/components/execd/pkg/runtime/types.go
+@@ -15,6 +15,7 @@
+ package runtime
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"sync"
+ 	"time"
+@@ -35,6 +36,7 @@
+ 
+ // ExecuteCodeRequest represents a code execution request with context and hooks.
+ type ExecuteCodeRequest struct {
++	RequestContext context.Context `json:"-"`
+ 	Language Language          `json:"language"`
+ 	Code     string            `json:"code"`
+ 	Argv     []string          `json:"argv,omitempty"`
+--- a/components/execd/pkg/runtime/ctrl.go
++++ b/components/execd/pkg/runtime/ctrl.go
+@@ -79,10 +79,12 @@
+ func (c *Controller) Execute(request *ExecuteCodeRequest) error {
+ 	var cancel context.CancelFunc
+ 	var ctx context.Context
++	parent := request.RequestContext
++	if parent == nil { parent = context.Background() }
+ 	if request.Timeout > 0 {
+-		ctx, cancel = context.WithTimeout(context.Background(), request.Timeout)
++		ctx, cancel = context.WithTimeout(parent, request.Timeout)
+ 	} else {
+-		ctx, cancel = context.WithCancel(context.Background())
++		ctx, cancel = context.WithCancel(parent)
+ 	}
+ 
+ 	switch request.Language {
+--- a/components/execd/pkg/web/controller/command.go
++++ b/components/execd/pkg/web/controller/command.go
+@@ -65,6 +65,7 @@
+ 	}
+ 
+ 	runCodeRequest := c.buildExecuteCommandRequest(request)
++	if !request.Background { runCodeRequest.RequestContext = ctx }
+ 	eventsHandler, stopSSE := c.setServerEventsHandler(ctx)
+ 
+ 	// completeCh is closed when OnExecuteComplete fires, meaning the final SSE
+--- a/components/execd/main.go
++++ b/components/execd/main.go
+@@ -229,7 +229,7 @@
+ 	lifecycleConfig *lifecycle.Config,
+ 	initManager *controller.RuntimeInitManager,
+ ) error {
+-	addr := fmt.Sprintf(":%d", flag.ServerPort)
++	addr := fmt.Sprintf("127.0.0.1:%d", flag.ServerPort)
+ 	listener, err := net.Listen("tcp4", addr)
+ 	if err != nil {
+ 		return fmt.Errorf("listen on %s: %w", addr, err)

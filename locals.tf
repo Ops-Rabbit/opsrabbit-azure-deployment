@@ -56,6 +56,10 @@ locals {
     endpoint = local.opensandbox_controller_origin
     apiKey   = random_password.opensandbox_api_key[0].result
     image    = local.opensandbox_runtime_image
+    resourceLimits = {
+      cpu    = "0.5"
+      memory = "1g"
+    }
   }) : null
 
   opensandbox_bootstrap_revision = local.opensandbox_enabled ? sha256(jsonencode({
@@ -67,7 +71,7 @@ locals {
   opensandbox_bootstrap_command = local.opensandbox_enabled ? join(" && ", [
     "until nc -z \"$POSTGRES_HOST\" 5432; do sleep 2; done",
     "set -o pipefail",
-    "node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --capabilities | grep -Fxq '{\"activation\":true,\"verification\":true,\"install\":true,\"contractVersion\":1}'",
+    "node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --capabilities | node -e 'let s=\"\"; process.stdin.on(\"data\", c => s+=c); process.stdin.on(\"end\", () => { try { const c=JSON.parse(s); process.exit(c.activation===true && c.verification===true && c.install===true && c.resourceLimits===true && c.contractVersion===1 ? 0 : 1); } catch { process.exit(1); } });'",
     "node /opt/opsrabbit/apps/backend/dist/scripts/db-migrate.js",
     "printf '%s' \"$OPENSANDBOX_BOOTSTRAP_JSON\" | node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --install",
   ]) : null

@@ -39,6 +39,7 @@ API_VERSION = "2025-02-02-preview"
 MAX_BODY = 33 * 1024 * 1024
 # Keep the advertised absolute lease within the maximum Azure idle cooldown.
 MAX_LEASE = 60 * 60
+RUNTIME_CONTRACT = "workspace-command-files-v1"
 ALLOWED_PATHS = {
     "/ping",
     "/command",
@@ -144,6 +145,10 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 self.db.execute(
                     "ALTER TABLE sessions ADD COLUMN caller_token INTEGER DEFAULT 0"
                 )
+            if "runtime_contract" not in columns:
+                self.db.execute(
+                    "ALTER TABLE sessions ADD COLUMN runtime_contract TEXT NOT NULL DEFAULT ''"
+                )
         if not self.postgres:
             self.db.execute("PRAGMA synchronous=FULL")
         self.shutdown = threading.Event()
@@ -204,6 +209,9 @@ class AzureSandboxService(SandboxService, ExtensionService):
         )
         self._execute(
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS caller_token INTEGER NOT NULL DEFAULT 0"
+        )
+        self._execute(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS runtime_contract TEXT NOT NULL DEFAULT ''"
         )
         self.db.commit()
 
@@ -310,7 +318,7 @@ class AzureSandboxService(SandboxService, ExtensionService):
 
     def _row(self, sid):
         row = self._execute(
-            "SELECT data, deadline, state, etag, token, secure_token, caller_token FROM sessions WHERE id=?",
+            "SELECT data, deadline, state, etag, token, secure_token, caller_token, runtime_contract FROM sessions WHERE id=?",
             (sid,),
         ).fetchone()
         if row is None or row[2] != "active":
@@ -332,6 +340,11 @@ class AzureSandboxService(SandboxService, ExtensionService):
             if persisted_image != self.image:
                 self._retire(sid)
                 fail(409, "Sandbox uses a superseded runtime image")
+            if row[7] != RUNTIME_CONTRACT:
+                # Older journals accepted caller-controlled metadata. Only the
+                # dedicated column, written after init, proves this contract.
+                self._retire(sid)
+                fail(409, "Sandbox runtime contract has not been verified")
             if row[1] <= time.time():
                 self._retire(sid)
                 fail(404, "Sandbox expired")
@@ -357,8 +370,42 @@ class AzureSandboxService(SandboxService, ExtensionService):
         with self._session_lock(sid):
             # Deny execution first; do not hold the database lock over Azure I/O.
             with self.lock:
-                self._execute("UPDATE sessions SET state='retiring' WHERE id=?", (sid,))
+                row = self._execute(
+                    "SELECT etag FROM sessions WHERE id=?", (sid,)
+                ).fetchone()
+                if row is None:
+                    # Includes stale janitor snapshots. An identifier alone
+                    # never authorizes stopping an untracked Azure allocation.
+                    fail(503, "Azure retirement ownership is not recorded")
+                changed = self._execute(
+                    "UPDATE sessions SET state='retiring' WHERE id=?", (sid,)
+                ).rowcount
                 self.db.commit()
+                if changed != 1:
+                    fail(503, "Azure retirement ownership changed")
+            check = self._request(sid, "/.management/getSession")
+            if (
+                check.status_code == 400
+                and check.json().get("error", {}).get("code")
+                == "SessionWithIdentifierNotFound"
+            ):
+                with self.lock:
+                    self._tombstone(sid)
+                return
+            # Missing creation time is deliberately NOT learned during
+            # recovery/retirement: it could belong to a replacement allocation.
+            if (
+                check.status_code != 200
+                or not row[0]
+                or check.json().get("createdAt") != row[0]
+            ):
+                fail(503, "Azure retirement generation is not verified")
+            with self.lock:
+                owned = self._execute(
+                    "SELECT etag, state FROM sessions WHERE id=?", (sid,)
+                ).fetchone()
+                if owned != (row[0], "retiring"):
+                    fail(503, "Azure retirement ownership changed")
             response = self._request(sid, "/.management/stopSession")
             if response.status_code not in (200, 400, 404):
                 fail(503, "Azure retirement not confirmed")
@@ -420,6 +467,10 @@ class AzureSandboxService(SandboxService, ExtensionService):
 
     def _create(self, request):
         # No ignored caller semantics: this pool has one fixed shape and no egress.
+        if any(
+            key.startswith("opsrabbit.runtime.") for key in (request.metadata or {})
+        ):
+            fail(400, "Runtime capability metadata is reserved for the controller")
         if (
             request.image is None
             or request.image.uri != self.image
@@ -494,7 +545,7 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 "id": sid,
                 "image": {"uri": self.image},
                 "status": {"state": "Running"},
-                "metadata": request.metadata,
+                "metadata": dict(request.metadata or {}),
                 "entrypoint": request.entrypoint,
                 "createdAt": datetime.fromtimestamp(now, timezone.utc).isoformat(),
                 "expiresAt": datetime.fromtimestamp(
@@ -523,6 +574,25 @@ class AzureSandboxService(SandboxService, ExtensionService):
                         503,
                         "Azure session runtime is not ready; no command was retried",
                     )
+                # Record this freshly allocated generation before init can
+                # fail. Later cleanup must never infer ownership from its ID.
+                allocation = self._request(sid, "/.management/getSession")
+                created_at = (
+                    allocation.json().get("createdAt")
+                    if allocation.status_code == 200
+                    else None
+                )
+                if not isinstance(created_at, str) or not created_at:
+                    fail(503, "Azure session allocation could not be verified")
+                with self.lock:
+                    self._require_leader()
+                    changed = self._execute(
+                        "UPDATE sessions SET etag=? WHERE id=? AND state='allocating' AND etag=''",
+                        (created_at, sid),
+                    ).rowcount
+                    self.db.commit()
+                    if changed != 1:
+                        fail(503, "Azure allocation ownership could not be recorded")
                 initialized = self.client.post(
                     self.pool + "/internal/init",
                     params={"identifier": sid, "api-version": API_VERSION},
@@ -544,16 +614,20 @@ class AzureSandboxService(SandboxService, ExtensionService):
                     or initialized.json().get("sandboxId") != sid
                     or initialized.json().get("status") != "initialized"
                     or initialized.json().get("generation") != 1
+                    or initialized.json().get("runtimeContract") != RUNTIME_CONTRACT
                 ):
                     fail(503, "Runtime binding could not be established")
                 metadata = self._request(sid, "/.management/getSession")
-                if metadata.status_code != 200 or not metadata.json().get("createdAt"):
+                if (
+                    metadata.status_code != 200
+                    or metadata.json().get("createdAt") != created_at
+                ):
                     fail(503, "Azure session allocation could not be verified")
                 with self.lock:
                     self._require_leader()
                     changed = self._execute(
-                        "UPDATE sessions SET state='active',etag=? WHERE id=? AND state='allocating' AND deadline>?",
-                        (metadata.json()["createdAt"], sid, time.time()),
+                        "UPDATE sessions SET state='active',runtime_contract=? WHERE id=? AND state='allocating' AND etag=? AND deadline>?",
+                        (RUNTIME_CONTRACT, sid, created_at, time.time()),
                     ).rowcount
                     self.db.commit()
                     if changed != 1:
@@ -564,18 +638,50 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 except Exception:
                     pass
                 raise
+        data["metadata"]["opsrabbit.runtime.contract"] = RUNTIME_CONTRACT
         return CreateSandboxResponse.model_validate(data)
 
     def get_sandbox(self, sandbox_id):
         with self.lock:
             self._require_leader()
-        return Sandbox.model_validate_json(self._live(sandbox_id)[0])
+        row = self._live(sandbox_id)
+        data = json.loads(row[0])
+        # Never export a capability claim from persisted caller metadata.
+        data["metadata"] = {
+            key: value
+            for key, value in (data.get("metadata") or {}).items()
+            if not key.startswith("opsrabbit.runtime.")
+        }
+        data["metadata"]["opsrabbit.runtime.contract"] = row[7]
+        return Sandbox.model_validate(data)
 
     def delete_sandbox(self, sandbox_id):
         with self.lock:
             self._require_leader()
             self._row(sandbox_id)
         self._retire(sandbox_id)
+
+    def delete_sandbox_confirmed(self, sandbox_id):
+        # A failed command may already have retired this allocation. Never
+        # interpret a missing journal row alone as proof of Azure termination.
+        with self._session_lock(sandbox_id):
+            with self.lock:
+                self._require_leader()
+                row = self._execute(
+                    "SELECT state FROM sessions WHERE id=?", (sandbox_id,)
+                ).fetchone()
+            if row is not None:
+                self._retire(sandbox_id)
+                return
+            check = self._request(sandbox_id, "/.management/getSession")
+            if (
+                check.status_code == 400
+                and check.json().get("error", {}).get("code")
+                == "SessionWithIdentifierNotFound"
+            ):
+                return
+            # Do not stop an allocation missing from this controller's journal.
+            fail(503, "Azure retirement not confirmed")
 
     def list_sandboxes(self, request):
         with self.lock:

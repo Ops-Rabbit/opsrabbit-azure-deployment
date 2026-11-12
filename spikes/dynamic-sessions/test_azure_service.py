@@ -84,7 +84,13 @@ class AdapterTests(unittest.TestCase):
                 },
             )
             return httpx.Response(
-                200, json={"status": "initialized", "sandboxId": sid, "generation": 1}
+                200,
+                json={
+                    "status": "initialized",
+                    "sandboxId": sid,
+                    "generation": 1,
+                    "runtimeContract": "workspace-command-files-v1",
+                },
             )
         if request.url.path == "/.management/stopSession":
             self.allocated.pop(sid, None)
@@ -122,6 +128,296 @@ class AdapterTests(unittest.TestCase):
         endpoint = self.service.get_endpoint(result.id, 44772)
         self.assertIsNone(endpoint.headers)
         self.assertNotIn("azurecontainerapps.io", endpoint.endpoint)
+
+    def test_runtime_contract_cannot_be_forged_by_caller(self):
+        self.assertRejected(
+            400,
+            lambda: self.service._create(
+                self.request(
+                    metadata={
+                        "opsrabbit.runtime.contract": "workspace-command-files-v1"
+                    }
+                )
+            ),
+        )
+        self.assertEqual(self.allocated, {})
+
+    def test_runtime_contract_is_confirmed_before_advertisement(self):
+        original = self.client.post
+
+        def missing_contract(*args, **kwargs):
+            response = original(*args, **kwargs)
+            data = response.json()
+            data.pop("runtimeContract", None)
+            return httpx.Response(200, json=data)
+
+        with patch.object(self.client, "post", side_effect=missing_contract):
+            self.assertRejected(503, lambda: self.service._create(self.request()))
+        self.assertEqual(self.allocated, {})
+        self.assertEqual(
+            self.service._execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0
+        )
+
+    def test_authenticated_metadata_binds_runtime_contract_to_image(self):
+        result = self.service._create(self.request(metadata={"purpose": "fixture"}))
+        info = self.service.get_sandbox(result.id)
+        self.assertEqual(
+            info.metadata["opsrabbit.runtime.contract"], "workspace-command-files-v1"
+        )
+        self.assertEqual(info.metadata["purpose"], "fixture")
+        self.assertEqual(info.image.uri, self.service.image)
+        persisted, contract = self.service._execute(
+            "SELECT data,runtime_contract FROM sessions WHERE id=?", (result.id,)
+        ).fetchone()
+        self.assertEqual(contract, "workspace-command-files-v1")
+        self.assertNotIn(
+            "opsrabbit.runtime.contract", json.loads(persisted)["metadata"]
+        )
+
+    def test_init_failure_has_durable_generation_but_no_contract(self):
+        original = self.client.post
+
+        def failed_init(*args, **kwargs):
+            sid = kwargs["params"]["identifier"]
+            row = self.service._execute(
+                "SELECT etag,runtime_contract,state FROM sessions WHERE id=?", (sid,)
+            ).fetchone()
+            self.assertEqual(row, (self.allocated[sid]["createdAt"], "", "allocating"))
+            original(*args, **kwargs)
+            return httpx.Response(503)
+
+        with patch.object(self.client, "post", side_effect=failed_init):
+            self.assertRejected(503, lambda: self.service._create(self.request()))
+        self.assertEqual(self.allocated, {})
+        self.assertEqual(
+            self.service._execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0
+        )
+
+    def test_generation_change_during_init_is_not_activated_or_stopped(self):
+        original = self.client.post
+
+        def replace_after_init(*args, **kwargs):
+            response = original(*args, **kwargs)
+            sid = kwargs["params"]["identifier"]
+            self.allocated[sid]["createdAt"] = "replacement-generation"
+            return response
+
+        with patch.object(self.client, "post", side_effect=replace_after_init):
+            self.assertRejected(503, lambda: self.service._create(self.request()))
+        self.assertNotIn("/.management/stopSession", self.calls)
+        self.assertEqual(len(self.allocated), 1)
+        self.assertEqual(
+            self.service._execute(
+                "SELECT state,runtime_contract FROM sessions"
+            ).fetchone(),
+            ("retiring", ""),
+        )
+
+    def test_confirmed_delete_refuses_replacement_generation(self):
+        sid = self.service._create(self.request()).id
+        self.allocated[sid]["createdAt"] = "replacement-generation"
+        self.calls.clear()
+        self.assertRejected(503, lambda: self.service.delete_sandbox_confirmed(sid))
+        self.assertEqual(self.calls, ["/.management/getSession"])
+        self.assertIn(sid, self.allocated)
+        self.assertEqual(
+            self.service._execute(
+                "SELECT state FROM sessions WHERE id=?", (sid,)
+            ).fetchone()[0],
+            "retiring",
+        )
+
+    def test_retirement_rechecks_journal_ownership_after_azure_lookup(self):
+        sid = self.service._create(self.request()).id
+        original = self.service._request
+
+        def remove_ownership(sandbox_id, path, method="POST"):
+            response = original(sandbox_id, path, method)
+            if path == "/.management/getSession":
+                self.service._execute("DELETE FROM sessions WHERE id=?", (sid,))
+                self.service.db.commit()
+            return response
+
+        self.calls.clear()
+        with patch.object(self.service, "_request", side_effect=remove_ownership):
+            self.assertRejected(503, lambda: self.service._retire(sid))
+        self.assertEqual(self.calls, ["/.management/getSession"])
+        self.assertIn(sid, self.allocated)
+
+    def test_public_contract_comes_from_provenance_not_saved_metadata(self):
+        sid = self.service._create(self.request()).id
+        data = json.loads(self.service._row(sid)[0])
+        data["metadata"] = {
+            "purpose": "fixture",
+            "opsrabbit.runtime.contract": "forged-contract",
+            "opsrabbit.runtime.extra": "forged-capability",
+        }
+        self.service._execute(
+            "UPDATE sessions SET data=? WHERE id=?", (json.dumps(data), sid)
+        )
+        self.service.db.commit()
+        self.assertEqual(
+            self.service.get_sandbox(sid).metadata,
+            {
+                "purpose": "fixture",
+                "opsrabbit.runtime.contract": "workspace-command-files-v1",
+            },
+        )
+
+    def test_stale_janitor_snapshot_cannot_stop_an_untracked_allocation(self):
+        sid = self.service._create(self.request()).id
+        self.service._execute("DELETE FROM sessions WHERE id=?", (sid,))
+        self.service.db.commit()
+        original = self.service._execute
+
+        def stale_snapshot(query, params=()):
+            if query.startswith("SELECT id FROM sessions WHERE state='retiring'"):
+                return SimpleNamespace(fetchall=lambda: [(sid,)])
+            return original(query, params)
+
+        self.calls.clear()
+        with (
+            patch.object(self.service, "_execute", side_effect=stale_snapshot),
+            patch.object(self.service.shutdown, "wait", side_effect=[False, True]),
+        ):
+            self.service._janitor()
+        self.assertEqual(self.calls, [])
+        self.assertIn(sid, self.allocated)
+
+    def test_recovery_cannot_stop_replaced_retiring_or_expired_allocations(self):
+        for state, deadline in (
+            ("retiring", time.time() + 120),
+            ("active", time.time() - 1),
+        ):
+            sid = self.service._create(self.request()).id
+            self.service._execute(
+                "UPDATE sessions SET state=?,deadline=? WHERE id=?",
+                (state, deadline, sid),
+            )
+            self.service.db.commit()
+            self.allocated[sid]["createdAt"] = "replacement-generation"
+            self.calls.clear()
+            self.assertRejected(503, self.service._recover)
+            self.assertNotIn("/.management/stopSession", self.calls)
+            self.assertIn(sid, self.allocated)
+            self.assertIsNotNone(
+                self.service._execute(
+                    "SELECT id FROM sessions WHERE id=?", (sid,)
+                ).fetchone()
+            )
+            # Isolate the next recovery case from this deliberately fenced row.
+            self.service._execute("DELETE FROM sessions WHERE id=?", (sid,))
+            self.service.db.commit()
+            self.allocated.pop(sid)
+
+    def test_recovery_without_generation_keeps_unknown_allocation_fenced(self):
+        sid = self.service._create(self.request()).id
+        self.service._execute(
+            "UPDATE sessions SET state='retiring',etag='',runtime_contract='' WHERE id=?",
+            (sid,),
+        )
+        self.service.db.commit()
+        self.calls.clear()
+        self.assertRejected(503, self.service._recover)
+        self.assertEqual(self.calls, ["/.management/getSession"])
+        self.assertIn(sid, self.allocated)
+        self.assertEqual(
+            self.service._execute(
+                "SELECT etag,state FROM sessions WHERE id=?", (sid,)
+            ).fetchone(),
+            ("", "retiring"),
+        )
+        # Reconciliation may erase the row only after Azure proves absence.
+        self.allocated.pop(sid)
+        self.calls.clear()
+        self.service._recover()
+        self.assertEqual(self.calls, ["/.management/getSession"])
+        self.assertIsNone(
+            self.service._execute(
+                "SELECT id FROM sessions WHERE id=?", (sid,)
+            ).fetchone()
+        )
+
+    def test_legacy_forged_metadata_is_not_contract_provenance_on_restart(self):
+        sid = self.service._create(self.request()).id
+        data = json.loads(self.service._row(sid)[0])
+        data["metadata"]["opsrabbit.runtime.contract"] = "workspace-command-files-v1"
+        self.service._execute(
+            "UPDATE sessions SET data=?,runtime_contract='' WHERE id=?",
+            (json.dumps(data), sid),
+        )
+        self.service.db.commit()
+        self.calls.clear()
+        self.restart_controller()
+        self.assertRejected(404, lambda: self.service.get_sandbox(sid))
+        self.assertNotIn(sid, self.allocated)
+        self.assertNotIn("/internal/init", self.calls)
+
+    def test_sqlite_upgrade_adds_empty_provenance_without_trusting_legacy_json(self):
+        import sqlite3
+
+        self.service.db.close()
+        self.service.db = sqlite3.connect(
+            os.environ["AZURE_SESSION_STATE"], check_same_thread=False
+        )
+        self.service.db.execute("DROP TABLE sessions")
+        self.service.db.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT, deadline REAL, state TEXT, etag TEXT, token TEXT, secure_token TEXT, caller_token INTEGER)"
+        )
+        sid = "legacy-unowned"
+        self.service.db.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
+            (
+                sid,
+                json.dumps(
+                    {
+                        "id": sid,
+                        "image": {"uri": self.service.image},
+                        "metadata": {
+                            "opsrabbit.runtime.contract": "workspace-command-files-v1"
+                        },
+                    }
+                ),
+                time.time() + 120,
+                "active",
+                "2026-11-03T00:00:00Z",
+                "synthetic",
+                "",
+                0,
+            ),
+        )
+        self.service.db.commit()
+        self.allocated[sid] = {"createdAt": "2026-11-03T00:00:00Z"}
+        self.restart_controller()
+        self.assertIn(
+            "runtime_contract",
+            [row[1] for row in self.service.db.execute("PRAGMA table_info(sessions)")],
+        )
+        self.assertNotIn(sid, self.allocated)
+        self.assertRejected(404, lambda: self.service.get_sandbox(sid))
+        self.restart_controller()  # Migration remains idempotent.
+
+    def test_confirmed_retirement_rechecks_azure_after_prior_deletion(self):
+        sid = self.service._create(self.request()).id
+        self.service.delete_sandbox(sid)
+        self.calls.clear()
+        self.service.delete_sandbox_confirmed(sid)
+        self.assertEqual(self.calls, ["/.management/getSession"])
+        self.assertRejected(404, lambda: self.service.get_sandbox(sid))
+
+    def test_confirmed_retirement_does_not_delete_untracked_allocations(self):
+        sid = "untracked-fixture"
+        self.allocated[sid] = {"createdAt": "2026-11-03T00:00:00Z"}
+        self.calls.clear()
+        self.assertRejected(503, lambda: self.service.delete_sandbox_confirmed(sid))
+        self.assertEqual(self.calls, ["/.management/getSession"])
+        self.assertIn(sid, self.allocated)
+
+    def test_confirmed_retirement_rejects_ambiguous_azure_failures(self):
+        with patch.object(self.service, "_request", return_value=httpx.Response(503)):
+            self.assertRejected(
+                503, lambda: self.service.delete_sandbox_confirmed("absent")
+            )
 
     def test_command_read_timeout_tracks_remaining_session_lease(self):
         timeout = stream_timeout(1800)

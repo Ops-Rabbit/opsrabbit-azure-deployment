@@ -273,7 +273,7 @@ run "complete_public_aca_topology" {
   }
 
   assert {
-    condition     = strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "--capabilities") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "'{\"activation\":true,\"verification\":true,\"install\":true,\"contractVersion\":1}'")
+    condition     = strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "--capabilities") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "c.resourceLimits===true")
     error_message = "ACA bootstrap must reject backend images without the verified-install contract."
   }
 
@@ -844,6 +844,8 @@ run "runtime_registry_access_boundary" {
       azapi_resource.opensandbox_pool_image_pull[0].body.properties.customContainerTemplate.containers[0].image == local.opensandbox_runtime_image &&
       azapi_resource.opensandbox_pool_image_pull[0].body.properties.customContainerTemplate.registryCredentials.server == azurerm_container_registry.opensandbox_runtime.login_server &&
       jsondecode(local.opensandbox_bootstrap_json).image == local.opensandbox_runtime_image &&
+      jsondecode(local.opensandbox_bootstrap_json).resourceLimits.cpu == "0.5" &&
+      jsondecode(local.opensandbox_bootstrap_json).resourceLimits.memory == "1g" &&
       one([for entry in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : entry.value if entry.name == "AZURE_SESSION_IMAGE"]) == local.opensandbox_runtime_image
     )
     error_message = "The pool, controller and product bootstrap must use the same immutable image in the runtime-only registry."

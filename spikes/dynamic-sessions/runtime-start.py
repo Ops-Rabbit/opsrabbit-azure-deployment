@@ -1,8 +1,20 @@
-"""Launch each execd API worker inside the same workspace-only boundary."""
+"""Launch a trusted command supervisor and a separately confined file worker."""
 
 import os
 import stat
 import sys
+
+PROTECTED_NAMES = (
+    ".opsrabbit-system",
+    ".opsrabbit-empty",
+    ".opsrabbit-skills",
+    ".opsrabbit-browser-runtime",
+)
+LAUNCHER_ENV = {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "LD_LIBRARY_PATH": "/usr/local/lib",
+    "HOME": "/workspace",
+}
 
 
 def ensure_workspace_tmp(path="/workspace/.tmp"):
@@ -14,9 +26,12 @@ def ensure_workspace_tmp(path="/workspace/.tmp"):
 
 
 def sandbox_args(port):
+    masks = []
+    for name in PROTECTED_NAMES:
+        masks += ["--ro-bind", "/opt/opsrabbit-system/empty", "/workspace/" + name]
     if port == "8082":
         return [
-            "bwrap",
+            "/usr/bin/bwrap",
             "--unshare-user",
             "--unshare-pid",
             "--unshare-ipc",
@@ -31,6 +46,7 @@ def sandbox_args(port):
             "--bind",
             "/workspace",
             "/workspace",
+            *masks,
             "--tmpfs",
             "/tmp",
             "--tmpfs",
@@ -55,9 +71,8 @@ def sandbox_args(port):
         ]
 
     args = [
-        "bwrap",
+        "/usr/bin/bwrap",
         "--unshare-user",
-        "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
         "--die-with-parent",
@@ -83,12 +98,20 @@ def sandbox_args(port):
         "--bind",
         "/workspace",
         "/workspace",
+        *masks,
         "--tmpfs",
         "/tmp",
         "--tmpfs",
         "/workspace/.tmp",
         "--dev",
         "/dev",
+        # Keep the container's existing proc mount (including its masks) in
+        # the trusted supervisor. Do not require a new procfs mount, or create
+        # a PID namespace whose IDs disagree with that inherited proc mount.
+        # Every user command gets a fresh PID namespace with an empty /proc.
+        "--bind",
+        "/proc",
+        "/proc",
         "--chdir",
         "/workspace",
         "--clearenv",
@@ -103,7 +126,7 @@ def sandbox_args(port):
         "/workspace",
         "--setenv",
         "TMPDIR",
-        "/workspace/.tmp",
+        "/tmp",
         "--",
     ]
     return args + [
@@ -123,11 +146,7 @@ def main():
         os.execve(
             "/usr/local/bin/python",
             ["python", "-I", "/opt/runtime-gateway.py"],
-            {
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "LD_LIBRARY_PATH": "/usr/local/lib",
-                "HOME": "/workspace",
-            },
+            LAUNCHER_ENV,
         )
         return
     elif len(sys.argv) == 2 and sys.argv[1] == "command":
@@ -138,7 +157,11 @@ def main():
         raise SystemExit("usage: runtime-start.py [command|files]")
     os.chdir("/workspace")
     ensure_workspace_tmp()
-    os.execvp("bwrap", sandbox_args(port))
+    # Prepare before either worker admits requests. Each worker masks these
+    # mountpoints, so neither file APIs nor command payloads can rename them.
+    for name in (*PROTECTED_NAMES, ".opsrabbit-runtime"):
+        ensure_workspace_tmp("/workspace/" + name)
+    os.execve("/usr/bin/bwrap", sandbox_args(port), LAUNCHER_ENV)
 
 
 if __name__ == "__main__":

@@ -204,7 +204,7 @@ run "complete_application_topology" {
   }
 
   assert {
-    condition     = strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "--capabilities") && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "'{\"activation\":true,\"verification\":true,\"install\":true,\"contractVersion\":1}'")
+    condition     = strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "--capabilities") && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "c.resourceLimits===true")
     error_message = "ACI bootstrap must reject backend images without the verified-install contract."
   }
 

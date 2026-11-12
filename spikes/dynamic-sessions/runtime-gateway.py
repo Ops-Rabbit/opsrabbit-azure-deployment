@@ -1,8 +1,9 @@
-"""Fixed local routing between equally confined command and file execd workers.
+"""Fixed routing to a mandatory command launcher and confined file worker.
 
 The lifecycle controller alone binds both daemons. No cloud identity, raw token,
-or caller-controlled route is stored here. Both workers enforce the same
-workspace-only filesystem boundary, including for direct API requests.
+or caller-controlled route is stored here. Only the trusted command supervisor
+has procfs; every command payload enters a fresh no-proc child. Raw workers
+bind loopback and the command children have a private network namespace.
 """
 
 import http.client
@@ -10,6 +11,8 @@ import json
 import math
 import os
 import posixpath
+import select
+import socket
 import subprocess
 import signal
 import threading
@@ -22,7 +25,38 @@ from urllib.parse import parse_qs, urlsplit
 MAX_BODY = 33 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 120
 MAX_COMMAND_STREAM_TIMEOUT = 3600
+RUNTIME_CONTRACT = "workspace-command-files-v1"
+PROTECTED_NAMES = frozenset(
+    (
+        ".opsrabbit-system",
+        ".opsrabbit-empty",
+        ".opsrabbit-skills",
+        ".opsrabbit-browser-runtime",
+    )
+)
 command = files = None
+
+
+def cancel_on_disconnect(client, upstream, finished):
+    """Cancel execd even when a foreground payload produces no more output."""
+    while not finished.is_set():
+        try:
+            readable, _, _ = select.select([client], [], [], 0.1)
+            if not readable:
+                continue
+            if client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                # No pipelined request is consumed by this HTTP/1.0 handler.
+                finished.wait(0.1)
+                continue
+        except BlockingIOError:
+            continue
+        except (OSError, ValueError):
+            pass
+        try:
+            upstream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        return
 
 
 def confined_path(value):
@@ -32,9 +66,75 @@ def confined_path(value):
     normalized = posixpath.normpath(candidate)
     if posixpath.commonpath(("/workspace", normalized)) != "/workspace":
         raise ValueError("file paths must stay inside /workspace")
+    if normalized.split("/")[2:3] and normalized.split("/")[2] in PROTECTED_NAMES:
+        raise ValueError("file path is reserved for the runtime")
     resolved = os.path.realpath(normalized)
     if posixpath.commonpath(("/workspace", resolved)) != "/workspace":
         raise ValueError("file paths must stay inside /workspace")
+    if resolved.split("/")[2:3] and resolved.split("/")[2] in PROTECTED_NAMES:
+        raise ValueError("file path is reserved for the runtime")
+
+
+def initialize_workers(body, headers):
+    """Advertise the immutable contract only after BOTH bindings are ready."""
+    request = json.loads(body)
+    allowed = {"sandboxId", "generation", "envs", "accessTokenHash"}
+    if not isinstance(request, dict) or set(request) - allowed:
+        raise ValueError("unsupported runtime initialization")
+    baseline = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LD_LIBRARY_PATH": "/usr/local/lib",
+        "HOME": "/workspace",
+    }
+    envs = request.get("envs", {})
+    if not isinstance(envs, dict) or any(
+        k not in baseline or baseline[k] != v for k, v in envs.items()
+    ):
+        raise ValueError("unsupported runtime initialization environment")
+    expected = (request.get("sandboxId"), request.get("generation"))
+    reply = None
+    for port in (8081, 8082):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", port, timeout=DEFAULT_REQUEST_TIMEOUT
+        )
+        try:
+            connection.request("POST", "/internal/init", body=body, headers=headers)
+            response = connection.getresponse()
+            payload = response.read(MAX_BODY + 1)
+            if response.status != 200 or len(payload) > MAX_BODY:
+                raise RuntimeError("runtime binding failed")
+            reply = json.loads(payload)
+            if (
+                not isinstance(reply, dict)
+                or reply.get("status") != "initialized"
+                or (reply.get("sandboxId"), reply.get("generation")) != expected
+            ):
+                raise RuntimeError("runtime binding mismatch")
+        finally:
+            connection.close()
+    # Check readiness after both bindings, never advertise on partial success.
+    for port in (8081, 8082):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", port, timeout=DEFAULT_REQUEST_TIMEOUT
+        )
+        try:
+            connection.request("GET", "/ready", headers=headers)
+            response = connection.getresponse()
+            payload = response.read(MAX_BODY + 1)
+            if response.status != 200 or len(payload) > MAX_BODY:
+                raise RuntimeError("runtime worker is not ready")
+            ready = json.loads(payload)
+            if (
+                not isinstance(ready, dict)
+                or ready.get("initialized") is not True
+                or (ready.get("sandboxId"), ready.get("generation")) != expected
+            ):
+                raise RuntimeError("runtime readiness mismatch")
+        finally:
+            connection.close()
+    if command.poll() is not None or files.poll() is not None:
+        raise RuntimeError("runtime worker exited")
+    return {**reply, "runtimeContract": RUNTIME_CONTRACT}
 
 
 def validate_file_request(method, path, query, content_type, body):
@@ -157,6 +257,25 @@ class Handler(BaseHTTPRequestHandler):
                 for key in ("Content-Type", "X-EXECD-ACCESS-TOKEN", "Range")
                 if key in self.headers
             }
+            if path == "/internal/init":
+                if self.command != "POST":
+                    self.send_error(405)
+                    return
+                try:
+                    initialized = initialize_workers(body, headers)
+                except (ValueError, UnicodeDecodeError):
+                    self.send_error(400, "invalid runtime initialization")
+                    return
+                except RuntimeError:
+                    self.send_error(503, "runtime initialization failed")
+                    return
+                payload = json.dumps(initialized).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             try:
                 validate_file_request(
                     self.command,
@@ -172,21 +291,25 @@ class Handler(BaseHTTPRequestHandler):
                 connection = http.client.HTTPConnection(
                     "127.0.0.1", port, timeout=request_timeout(self.command, path, body)
                 )
+                finished = threading.Event()
+                disconnect_watcher = None
                 try:
                     connection.request(
                         self.command, self.path, body=body, headers=headers
                     )
+                    if self.command == "POST" and path == "/command":
+                        disconnect_watcher = threading.Thread(
+                            target=cancel_on_disconnect,
+                            args=(self.connection, connection.sock, finished),
+                            daemon=True,
+                        )
+                        disconnect_watcher.start()
                     response = connection.getresponse()
                     if index < len(ports) - 1:
                         reply = response.read(MAX_BODY + 1)
                         if response.status != 200 or len(reply) > MAX_BODY:
                             self.send_error(503)
                             return
-                        if path == "/internal/init":
-                            binding = json.loads(reply)
-                            if binding.get("status") != "initialized":
-                                self.send_error(503)
-                                return
                         continue
                     self.send_response(response.status)
                     for key in (
@@ -202,6 +325,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()
                 finally:
+                    finished.set()
+                    if disconnect_watcher is not None:
+                        disconnect_watcher.join(timeout=1)
                     connection.close()
         except (OSError, ValueError, http.client.HTTPException):
             self.close_connection = True
@@ -249,11 +375,20 @@ def main():
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     try:
+        worker_env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LD_LIBRARY_PATH": "/usr/local/lib",
+            "HOME": "/workspace",
+        }
         command = subprocess.Popen(
-            ["python", "/opt/runtime-start.py", "command"], close_fds=True
+            ["/usr/local/bin/python", "-I", "-S", "/opt/runtime-start.py", "command"],
+            env=worker_env,
+            close_fds=True,
         )
         files = subprocess.Popen(
-            ["python", "/opt/runtime-start.py", "files"], close_fds=True
+            ["/usr/local/bin/python", "-I", "-S", "/opt/runtime-start.py", "files"],
+            env=worker_env,
+            close_fds=True,
         )
         wait_for_workers()
         server = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)

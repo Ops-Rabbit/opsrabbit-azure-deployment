@@ -63,7 +63,10 @@ replace(
     "    sandbox_service.delete_sandbox(sandbox_id)\n    return Response(status_code=status.HTTP_204_NO_CONTENT)",
     """    if wait_for_termination and get_config().runtime.type != "azure_dynamic_sessions":
         raise HTTPException(status_code=501, detail="Confirmed retirement is unavailable")
-    sandbox_service.delete_sandbox(sandbox_id)
+    if wait_for_termination:
+        sandbox_service.delete_sandbox_confirmed(sandbox_id)
+    else:
+        sandbox_service.delete_sandbox(sandbox_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT,
                     headers={"X-OpsRabbit-Workload-Deleted": "true"} if wait_for_termination else None)""",
 )

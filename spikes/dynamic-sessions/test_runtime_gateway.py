@@ -1,6 +1,7 @@
 """Verify worker admission and supervision without starting sandbox processes."""
 
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -25,6 +26,20 @@ class GatewayLifecycleTests(unittest.TestCase):
     def test_command_timeout_includes_runtime_margin(self):
         timeout = self.g["request_timeout"]("POST", "/command", b'{"timeout":180000}')
         self.assertEqual(timeout, 210)
+
+    def test_disconnected_client_cancels_upstream_without_waiting_for_output(self):
+        client, upstream, finished = Mock(), Mock(), Mock()
+        finished.is_set.return_value = False
+        client.recv.return_value = b""
+        with patch.object(self.g["select"], "select", return_value=([client], [], [])):
+            self.g["cancel_on_disconnect"](client, upstream, finished)
+        upstream.shutdown.assert_called_once_with(self.g["socket"].SHUT_RDWR)
+
+    def test_completed_stream_does_not_cancel_another_command(self):
+        client, upstream, finished = Mock(), Mock(), Mock()
+        finished.is_set.return_value = True
+        self.g["cancel_on_disconnect"](client, upstream, finished)
+        upstream.shutdown.assert_not_called()
 
     def test_command_timeout_is_capped_at_session_maximum(self):
         timeout = self.g["request_timeout"]("POST", "/command", b'{"timeout":7200000}')
@@ -107,6 +122,112 @@ class GatewayLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "workspace"):
                 self.g["validate_file_request"](
                     "GET", "/files/download", "path=%2Fworkspace%2Fescape", "", b""
+                )
+
+    def test_reserved_paths_are_rejected_but_stdin_runtime_is_supported(self):
+        validate = self.g["validate_file_request"]
+        for name in self.g["PROTECTED_NAMES"]:
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "reserved"),
+            ):
+                validate(
+                    "GET",
+                    "/files/download",
+                    "path=/workspace/" + name + "/secret",
+                    "",
+                    b"",
+                )
+        validate(
+            "GET",
+            "/files/download",
+            "path=/workspace/.opsrabbit-runtime/stdin",
+            "",
+            b"",
+        )
+
+    def test_symlink_to_reserved_path_is_rejected(self):
+        with patch.object(
+            self.g["os"].path,
+            "realpath",
+            return_value="/workspace/.opsrabbit-system/key",
+        ):
+            with self.assertRaisesRegex(ValueError, "reserved"):
+                self.g["confined_path"]("/workspace/alias")
+
+    def init_connections(self, replies):
+        connections = []
+        for status, payload in replies:
+            response = Mock(status=status)
+            response.read.return_value = json.dumps(payload).encode()
+            connection = Mock()
+            connection.getresponse.return_value = response
+            connections.append(connection)
+        return connections
+
+    def test_contract_requires_both_bound_and_ready_workers(self):
+        binding = {"sandboxId": "fixture", "generation": 1}
+        initialized = {**binding, "status": "initialized"}
+        ready = {**binding, "initialized": True}
+        connections = self.init_connections(
+            [(200, initialized), (200, initialized), (200, ready), (200, ready)]
+        )
+        with patch.object(
+            self.g["http"].client, "HTTPConnection", side_effect=connections
+        ) as factory:
+            reply = self.g["initialize_workers"](json.dumps(binding).encode(), {})
+        self.assertEqual(reply["runtimeContract"], "workspace-command-files-v1")
+        self.assertEqual(
+            [call.args[1] for call in factory.call_args_list], [8081, 8082, 8081, 8082]
+        )
+        self.assertEqual(
+            [conn.request.call_args.args[:2] for conn in connections],
+            [
+                ("POST", "/internal/init"),
+                ("POST", "/internal/init"),
+                ("GET", "/ready"),
+                ("GET", "/ready"),
+            ],
+        )
+        for connection in connections:
+            connection.close.assert_called_once()
+
+    def test_contract_is_not_returned_on_partial_init_or_readiness_mismatch(self):
+        binding = {"sandboxId": "fixture", "generation": 1}
+        initialized = {**binding, "status": "initialized"}
+        ready = {**binding, "initialized": True}
+        for replies in (
+            [(200, initialized), (409, {})],
+            [(200, initialized), (200, {**initialized, "sandboxId": "different"})],
+            [(200, initialized), (200, initialized), (503, {})],
+            [
+                (200, initialized),
+                (200, initialized),
+                (200, ready),
+                (200, {**ready, "generation": 2}),
+            ],
+        ):
+            with patch.object(
+                self.g["http"].client,
+                "HTTPConnection",
+                side_effect=self.init_connections(replies),
+            ):
+                with self.assertRaises(RuntimeError):
+                    self.g["initialize_workers"](json.dumps(binding).encode(), {})
+
+    def test_init_cannot_inject_parent_hooks_or_claim_contract(self):
+        for extra in (
+            {"runtimeContract": "workspace-command-files-v1"},
+            {"lifecycle": {"preStart": "touch /tmp/parent"}},
+            {"envs": {"BASH_ENV": "/workspace/startup"}},
+            {"envs": {"PATH": "/workspace"}},
+        ):
+            with self.assertRaises(ValueError):
+                self.g["initialize_workers"](
+                    json.dumps(
+                        {"sandboxId": "fixture", "generation": 1, **extra}
+                    ).encode(),
+                    {},
                 )
 
     def test_file_json_path_maps_are_confined(self):

@@ -42,6 +42,7 @@ class PostgresRecoveryTests(unittest.TestCase):
             )
         )
         self.requests = []
+        self.allocated = {"active-session": {"createdAt": "2026-11-09T00:00:00Z"}}
         with psycopg.connect(admin_url, autocommit=True) as db:
             db.execute("DROP SCHEMA IF EXISTS opensandbox CASCADE")
             db.execute("DROP ROLE IF EXISTS opensandbox_test")
@@ -74,10 +75,11 @@ class PostgresRecoveryTests(unittest.TestCase):
         sid = request.url.params["identifier"]
         self.requests.append((request.method, request.url.path, sid))
         if request.url.path == "/.management/stopSession":
+            self.allocated.pop(sid, None)
             return httpx.Response(200)
         if request.url.path == "/.management/getSession":
-            if sid == "active-session":
-                return httpx.Response(200, json={"createdAt": "2026-11-09T00:00:00Z"})
+            if sid in self.allocated:
+                return httpx.Response(200, json=self.allocated[sid])
             return httpx.Response(
                 400,
                 json={"error": {"code": "SessionWithIdentifierNotFound"}},
@@ -95,7 +97,7 @@ class PostgresRecoveryTests(unittest.TestCase):
     def test_restart_revalidates_active_session_without_reallocating(self):
         with psycopg.connect(self.database_url) as db:
             db.execute(
-                "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token,secure_token,caller_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token,secure_token,caller_token,runtime_contract) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     "active-session",
                     json.dumps(
@@ -112,6 +114,7 @@ class PostgresRecoveryTests(unittest.TestCase):
                     "synthetic-token",
                     "",
                     0,
+                    "workspace-command-files-v1",
                 ),
             )
         db.close()
@@ -134,6 +137,7 @@ class PostgresRecoveryTests(unittest.TestCase):
             self.assertTrue(service.db.closed)
 
     def test_restart_retires_interrupted_allocation_before_serving(self):
+        self.allocated["interrupted-session"] = {"createdAt": "2026-11-09T01:00:00Z"}
         with psycopg.connect(self.database_url) as db:
             db.execute(
                 "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token,secure_token,caller_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -142,7 +146,7 @@ class PostgresRecoveryTests(unittest.TestCase):
                     json.dumps({"id": "interrupted-session"}),
                     4_102_444_800,
                     "allocating",
-                    "",
+                    "2026-11-09T01:00:00Z",
                     "synthetic-token",
                     "",
                     0,
@@ -157,6 +161,7 @@ class PostgresRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 self.requests,
                 [
+                    ("POST", "/.management/getSession", "interrupted-session"),
                     ("POST", "/.management/stopSession", "interrupted-session"),
                     ("POST", "/.management/getSession", "interrupted-session"),
                 ],
@@ -184,6 +189,136 @@ class PostgresRecoveryTests(unittest.TestCase):
                 ).fetchone()[0]
             )
 
+    def test_legacy_provenance_migration_retires_forged_metadata_idempotently(self):
+        with psycopg.connect(self.database_url, autocommit=True) as db:
+            db.execute("ALTER TABLE opensandbox.sessions DROP COLUMN runtime_contract")
+            db.execute(
+                "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token) VALUES (%s,%s,%s,%s,%s,%s)",
+                (
+                    "active-session",
+                    json.dumps(
+                        {
+                            "id": "active-session",
+                            "image": {"uri": os.environ["AZURE_SESSION_IMAGE"]},
+                            "metadata": {
+                                "opsrabbit.runtime.contract": "workspace-command-files-v1"
+                            },
+                        }
+                    ),
+                    4_102_444_800,
+                    "active",
+                    "2026-11-09T00:00:00Z",
+                    "synthetic-token",
+                ),
+            )
+        service = self.service()
+        try:
+            self.assertTrue(service.leader_ready)
+            self.assertTrue(service.db.autocommit)
+            self.assertEqual(
+                service._execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0
+            )
+            self.assertNotIn("active-session", self.allocated)
+            self.assertEqual(
+                self.requests,
+                [
+                    ("POST", "/.management/getSession", "active-session"),
+                    ("POST", "/.management/stopSession", "active-session"),
+                    ("POST", "/.management/getSession", "active-session"),
+                ],
+            )
+            self.assertEqual(
+                service.db.execute(
+                    "SELECT is_nullable FROM information_schema.columns WHERE table_schema='opensandbox' AND table_name='sessions' AND column_name='runtime_contract'"
+                ).fetchone(),
+                ("NO",),
+            )
+        finally:
+            service.close()
+        service = self.service()
+        try:
+            self.assertTrue(service.leader_ready)
+        finally:
+            service.close()
+
+    def test_interrupted_allocation_without_generation_blocks_recovery_until_absent(
+        self,
+    ):
+        service = self.service()
+        sid = "legacy-interrupted"
+        self.allocated[sid] = {"createdAt": "unknown-generation"}
+        try:
+            service._execute(
+                "INSERT INTO sessions (id,data,deadline,state,etag,token) VALUES (?,?,?,?,?,?)",
+                (
+                    sid,
+                    json.dumps({"id": sid}),
+                    4_102_444_800,
+                    "allocating",
+                    "",
+                    "synthetic",
+                ),
+            )
+            service.db.execute(
+                "SELECT pg_advisory_unlock(%s,%s)", service.leadership_lock_key
+            )
+            service.leader_ready = False
+            with self.assertRaises(HTTPException) as error:
+                service._try_become_leader()
+            self.assertEqual(error.exception.status_code, 503)
+            self.assertFalse(service.leader_ready)
+            self.assertEqual(self.requests, [("POST", "/.management/getSession", sid)])
+            self.assertEqual(
+                service._execute(
+                    "SELECT state,etag,runtime_contract FROM sessions WHERE id=?",
+                    (sid,),
+                ).fetchone(),
+                ("retiring", "", ""),
+            )
+            self.assertIn(sid, self.allocated)
+            self.assertTrue(service.db.autocommit)
+            self.allocated.pop(sid)
+            self.assertTrue(service._try_become_leader())
+            self.assertIsNone(
+                service._execute(
+                    "SELECT id FROM sessions WHERE id=?", (sid,)
+                ).fetchone()
+            )
+            self.assertNotIn(("POST", "/.management/stopSession", sid), self.requests)
+        finally:
+            service.close()
+
+    def test_confirmed_retirement_checks_durable_generation_and_missing_rows(self):
+        service = self.service()
+        try:
+            service._execute(
+                "INSERT INTO sessions (id,data,deadline,state,etag,token,runtime_contract) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "active-session",
+                    "{}",
+                    4_102_444_800,
+                    "retiring",
+                    "old-generation",
+                    "synthetic",
+                    "workspace-command-files-v1",
+                ),
+            )
+            with self.assertRaises(HTTPException) as error:
+                service.delete_sandbox_confirmed("active-session")
+            self.assertEqual(error.exception.status_code, 503)
+            self.assertEqual(
+                self.requests, [("POST", "/.management/getSession", "active-session")]
+            )
+            self.assertIn("active-session", self.allocated)
+            service._execute("DELETE FROM sessions WHERE id=?", ("active-session",))
+            self.requests.clear()
+            with self.assertRaises(HTTPException):
+                service._retire("active-session")
+            self.assertEqual(self.requests, [])
+            self.assertIn("active-session", self.allocated)
+        finally:
+            service.close()
+
     def test_overlapping_controllers_serialize_recovery_with_advisory_lock(self):
         leader = self.service()
         follower = self.service()
@@ -203,7 +338,7 @@ class PostgresRecoveryTests(unittest.TestCase):
         service = self.service()
         with psycopg.connect(self.database_url) as db:
             db.execute(
-                "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token,secure_token,caller_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO opensandbox.sessions (id,data,deadline,state,etag,token,secure_token,caller_token,runtime_contract) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     "active-session",
                     json.dumps(
@@ -220,6 +355,7 @@ class PostgresRecoveryTests(unittest.TestCase):
                     "synthetic-token",
                     "",
                     0,
+                    "workspace-command-files-v1",
                 ),
             )
         # Simulate a new controller acquiring leadership after a revision

@@ -580,6 +580,19 @@ use the required workspace-only/session policy, and pass verification with the
 saved encrypted key. Disabled or incompatible settings stop installation and
 require administrator reconciliation; the installer never overwrites them.
 
+The backend must also advertise `resourceLimits: true` in its bootstrap
+capabilities. The installer supplies `0.5` CPU and `1g` memory, matching the
+Azure session pool; the product's generic defaults are not used for this pool.
+Older builds without this capability stop before migration rather than saving
+an incompatible configuration.
+
+The Azure runtime enforces a fresh workspace-only boundary for every command.
+Its controller advertises the versioned `workspace-command-files-v1` contract
+only after the approved runtime confirms it. OpsRabbit checks that authenticated
+claim against the allocation and configured image digest before using native
+command execution. Legacy runtimes retain the product's existing wrapper.
+Browser execution remains unavailable for this command/file runtime.
+
 Changes to the controller endpoint, server or runtime image digest, session
 limit, or generated credentials create new ACA revisions. The application
 revision reruns the installer bootstrap; the controller revision reloads its
