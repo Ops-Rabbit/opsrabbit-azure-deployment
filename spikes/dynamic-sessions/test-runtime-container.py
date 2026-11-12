@@ -7,6 +7,140 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+
+def apparmor_policy(name):
+    """CI-only named profile: never attaches to a host executable by path.
+
+    Rule classes follow upstream's bwrap-userns-restrict profile (ABI 5).
+    Use ix, not pix: the trusted nested bwrap must inherit permission rather
+    than stack the host's unpriv_bwrap capability denial under no-new-privs.
+    This replaces the fixture's apparmor=unconfined, not runtime isolation.
+    Payload namespace creation remains denied by the immutable seccomp filter.
+    https://gitlab.com/apparmor/apparmor/-/blob/master/profiles/apparmor/profiles/extras/bwrap-userns-restrict
+    https://manpages.ubuntu.com/manpages/resolute/man5/apparmor.d.5.html
+    """
+    if not name.startswith("skills156-ci-") or not name[13:].isalnum():
+        raise ValueError("invalid fixture profile name")
+    return f"""abi <abi/5.0>,
+profile {name} flags=(attach_disconnected,mediate_deleted) {{
+  allow capability,
+  allow file rwlkm /{{**,}},
+  allow ix /**,
+  allow network,
+  allow unix,
+  allow ptrace,
+  allow signal,
+  allow mqueue,
+  allow io_uring,
+  allow userns create,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow dbus,
+}}
+"""
+
+
+def policy_command(policy, *options):
+    # Stdin avoids persistent host policy files/cache. -a never replaces an
+    # existing profile. Compilation warnings are failures, not a fallback.
+    # https://manpages.ubuntu.com/manpages/resolute/man8/apparmor_parser.8.html
+    subprocess.run(
+        ["sudo", "-n", "/usr/sbin/apparmor_parser", "-K", *options],
+        input=policy,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+
+@contextmanager
+def fixture_apparmor(enabled):
+    if not enabled:
+        yield "unconfined"
+        return
+    name = "skills156-ci-" + uuid.uuid4().hex
+    policy = apparmor_policy(name)
+    print("CI container AppArmor policy:\n" + policy, flush=True)
+    policy_command(policy, "-Q", "--Werror")
+    try:
+        # Cleanup is attempted even after a timeout/ambiguous load failure.
+        policy_command(policy, "-a", "--Werror")
+        yield name
+    finally:
+        policy_command(policy, "-R")
+        print("Removed CI AppArmor profile " + name, flush=True)
+
+
+def host_prerequisites():
+    """Read only; never change global sysctls, profiles, or kernel settings."""
+    paths = (
+        "/proc/sys/kernel/osrelease",
+        "/proc/sys/kernel/unprivileged_userns_clone",
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_unconfined",
+        "/proc/sys/user/max_user_namespaces",
+        "/sys/module/apparmor/parameters/enabled",
+    )
+    evidence = {}
+    for path in paths:
+        try:
+            evidence[path] = Path(path).read_text().strip()
+        except OSError as error:
+            evidence[path] = type(error).__name__
+    print("Host namespace prerequisites: " + json.dumps(evidence), flush=True)
+
+
+def container_prerequisites(container, expected_profile):
+    inspected = json.loads(
+        subprocess.check_output(["docker", "inspect", container], timeout=10)
+    )[0]
+    evidence = {
+        "apparmor": inspected["AppArmorProfile"],
+        "securityOptions": inspected["HostConfig"]["SecurityOpt"],
+        "capAdd": inspected["HostConfig"]["CapAdd"],
+        "user": inspected["Config"]["User"],
+    }
+    print("Container namespace prerequisites: " + json.dumps(evidence), flush=True)
+    if expected_profile != "unconfined" and evidence["apparmor"] != expected_profile:
+        raise RuntimeError("CI AppArmor profile was not attached to the container")
+    # Read only safe kernel fields, never cmdline/environ. This observes the
+    # trusted supervisor after its outer bwrap has dropped capabilities.
+    script = """
+import json
+from pathlib import Path
+fields = {'Name','Pid','PPid','Uid','Gid','CapInh','CapPrm','CapEff','CapBnd',
+          'CapAmb','NoNewPrivs','Seccomp'}
+for entry in sorted(Path('/proc').iterdir()):
+    if not entry.name.isdecimal():
+        continue
+    try:
+        status = dict(line.split(':',1) for line in (entry/'status').read_text().splitlines())
+        result = {key:value.strip() for key,value in status.items() if key in fields}
+        for name in ('attr/current','uid_map','gid_map'):
+            try: result[name] = (entry/name).read_text().strip()
+            except OSError as error: result[name] = type(error).__name__
+        print(json.dumps(result), flush=True)
+    except OSError:
+        pass
+"""
+    subprocess.run(
+        [
+            "docker",
+            "exec",
+            container,
+            "/usr/local/bin/python",
+            "-I",
+            "-S",
+            "-c",
+            script,
+        ],
+        check=True,
+        timeout=15,
+    )
 
 
 def parse_event(line):
@@ -163,7 +297,13 @@ os.execv(target,[target,'-c',AFTER_EXEC])
     return ["/usr/local/bin/python", "-c", code]
 
 
-def main(image):
+def main(image, ci_apparmor=False):
+    host_prerequisites()
+    with fixture_apparmor(ci_apparmor) as profile:
+        exercise_runtime(image, profile)
+
+
+def exercise_runtime(image, profile):
     network = "skills156-runtime-" + uuid.uuid4().hex[:12]
     container = None
     try:
@@ -183,7 +323,7 @@ def main(image):
                 # Exercise Bubblewrap mount isolation on the ephemeral,
                 # read-only-token CI runner; this is test-container-only.
                 "--security-opt",
-                "apparmor=unconfined",
+                "apparmor=" + profile,
                 "--security-opt",
                 "seccomp=unconfined",
                 "--cap-add",
@@ -272,6 +412,7 @@ def main(image):
             != "workspace-command-files-v1"
         ):
             raise RuntimeError("runtime did not advertise the enforced contract")
+        container_prerequisites(container, profile)
         for endpoint in ("/code", "/session", "/pty"):
             status, _ = request(
                 host,
@@ -556,22 +697,28 @@ print('namespace-filter-ok')
         )
         print("Native workspace command/file contract, isolation and cleanup: PASS")
     finally:
-        if container is not None:
+        try:
+            if container is not None:
+                subprocess.run(
+                    ["docker", "rm", "-f", container],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+        finally:
             subprocess.run(
-                ["docker", "rm", "-f", container],
+                ["docker", "network", "rm", network],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=15,
             )
-        subprocess.run(
-            ["docker", "network", "rm", network],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: test-runtime-container.py <image>")
-    main(sys.argv[1])
+    if len(sys.argv) not in (2, 3) or (
+        len(sys.argv) == 3 and sys.argv[2] != "--ci-apparmor"
+    ):
+        raise SystemExit("usage: test-runtime-container.py <image> [--ci-apparmor]")
+    main(sys.argv[1], ci_apparmor=len(sys.argv) == 3)
