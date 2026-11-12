@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 import hashlib
 import io
 import json
+import socket
 import tempfile
 import time
 import unittest
@@ -20,6 +21,8 @@ from opensandbox_server.api.schema import CreateSandboxRequest
 from opensandbox_server.services.azure_service import (
     ALLOWED_PATHS,
     AzureSandboxService,
+    ForegroundCommand,
+    foreground_command,
     stream_timeout,
 )
 
@@ -923,6 +926,483 @@ class AdapterTests(unittest.TestCase):
             self.assertRejected(413, lambda: self.service.forward(handler))
         self.assertEqual(statuses, [])
         self.assertEqual(handler.wfile.getvalue(), b"")
+
+    def test_foreground_requires_strict_boolean_or_omission(self):
+        self.assertTrue(foreground_command(b"{}"))
+        self.assertTrue(foreground_command(b'{"background":false}'))
+        self.assertFalse(foreground_command(b'{"background":true}'))
+        for value in (None, 0, 1, "false", [], {}):
+            self.assertRejected(
+                400, lambda: foreground_command(json.dumps({"background": value}))
+            )
+        for value in (b"null", b"[]", b"{"):
+            self.assertRejected(400, lambda: foreground_command(value))
+
+    def test_command_tracker_fragmented_wire_forms_and_terminal_races(self):
+        execution_id = "a" * 32
+        for prefix in (b"", b"data: "):
+            state = ForegroundCommand()
+            record = (
+                prefix
+                + json.dumps({"type": "init", "text": execution_id}).encode()
+                + b"\n\n"
+            )
+            for chunk in (record[:7], record[7:25], record[25:]):
+                state.feed(chunk)
+            state.abandoned.set()
+            self.assertEqual(state.cancel_id(), execution_id)
+            state.feed(b'{"type":"stdout","text":"execution_complete"}\n')
+            self.assertEqual(state.cancel_id(), execution_id)
+            state.feed(prefix + b'{"type":"execution_complete"}\n')
+            self.assertIsNone(state.cancel_id())
+        for value in ("../other", "a" * 31, "B" * 32, 1):
+            state = ForegroundCommand()
+            state.feed(json.dumps({"type": "init", "text": value}).encode() + b"\n")
+            state.abandoned.set()
+            self.assertIsNone(state.cancel_id())
+
+    def test_tracker_never_reads_forged_init_inside_oversized_stdout(self):
+        state = ForegroundCommand()
+        state.feed(b"x" * (64 * 1024 + 1))
+        self.assertLessEqual(len(state.pending), 64 * 1024)
+        state.feed(b'{"type":"init","text":"' + b"a" * 32 + b'"}\n')
+        state.abandoned.set()
+        self.assertIsNone(state.cancel_id())
+        state.feed(b'{"type":"init","text":"' + b"b" * 32 + b'"}\n')
+        self.assertEqual(state.cancel_id(), "b" * 32)
+        state.feed(b'{"type":"init","text":"' + b"c" * 32 + b'"}\n')
+        self.assertIsNone(state.cancel_id())
+
+    def cancel_fixture(self):
+        self.service.max_sessions = 16  # Independent bindings for each subcase.
+        sid = self.service._create(self.request()).id
+        row = self.service._row(sid)
+        state = ForegroundCommand()
+        state.feed(b'{"type":"init","text":"' + b"a" * 32 + b'"}\n')
+        state.abandoned.set()
+        headers = {"Authorization": "Bearer synthetic", "X-EXECD-ACCESS-TOKEN": row[4]}
+        return sid, row, state, headers
+
+    def test_exact_cancel_checks_generation_and_never_reuses_callers_selectors(self):
+        sid, row, state, headers = self.cancel_fixture()
+        requests = []
+        original = self.transport
+
+        def transport(request):
+            requests.append(request)
+            return original(request)
+
+        self.service.client.close()
+        self.service.client = httpx.Client(transport=httpx.MockTransport(transport))
+        for _ in range(2):
+            self.service._cancel_foreground(sid, row, state, headers)
+        self.assertEqual(
+            [(r.method, r.url.path) for r in requests],
+            [("POST", "/.management/getSession"), ("DELETE", "/command")],
+        )
+        self.assertEqual(
+            dict(requests[-1].url.params),
+            {"identifier": sid, "api-version": "2025-02-02-preview", "id": "a" * 32},
+        )
+        self.assertEqual(requests[-1].headers["X-EXECD-ACCESS-TOKEN"], row[4])
+        self.assertEqual(requests[-1].headers["Connection"], "close")
+        self.assertEqual(requests[-1].content, b"")
+        self.assertLessEqual(requests[-1].extensions["timeout"]["read"], 0.25)
+
+    def test_cancel_refuses_missing_expired_rebound_and_nonleader_sessions(self):
+        for mutation in (
+            "missing",
+            "expired",
+            "token",
+            "generation",
+            "nonleader",
+            "complete",
+        ):
+            with self.subTest(mutation=mutation):
+                sid, row, state, headers = self.cancel_fixture()
+                if mutation == "missing":
+                    self.service.db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+                elif mutation == "expired":
+                    self.service.db.execute(
+                        "UPDATE sessions SET deadline=0 WHERE id=?", (sid,)
+                    )
+                elif mutation in ("token", "generation"):
+                    column = "token" if mutation == "token" else "etag"
+                    self.service.db.execute(
+                        f"UPDATE sessions SET {column}='changed' WHERE id=?", (sid,)
+                    )
+                elif mutation == "nonleader":
+                    self.service.leader_ready = False
+                else:
+                    state.feed(b'{"type":"execution_complete"}\n')
+                with patch.object(self.service, "_cancel_request") as request:
+                    self.service._cancel_foreground(sid, row, state, headers)
+                request.assert_not_called()
+                self.service.leader_ready = True
+
+    def test_cancel_refuses_changed_azure_generation_and_late_completion(self):
+        for outcome in ("replacement", "completion", "expiry", "timeout"):
+            with self.subTest(outcome=outcome):
+                sid, row, state, headers = self.cancel_fixture()
+
+                def generation(*args, **kwargs):
+                    if outcome == "timeout":
+                        raise httpx.ReadTimeout("synthetic")
+                    if outcome == "completion":
+                        state.feed(b'{"type":"execution_complete"}\n')
+                    if outcome == "expiry":
+                        self.service.db.execute(
+                            "UPDATE sessions SET deadline=0 WHERE id=?", (sid,)
+                        )
+                    return 200, {
+                        "createdAt": "replacement"
+                        if outcome == "replacement"
+                        else row[3]
+                    }
+
+                with patch.object(
+                    self.service, "_cancel_request", side_effect=generation
+                ) as request:
+                    self.service._cancel_foreground(sid, row, state, headers)
+                self.assertEqual(request.call_count, 1)
+
+    def test_background_and_completed_foreground_never_send_cancel(self):
+        sid = self.service._create(self.request()).id
+        original = self.transport
+        deletes = []
+
+        def transport(request):
+            if request.url.path == "/command":
+                if request.method == "DELETE":
+                    deletes.append(request)
+                    return httpx.Response(200)
+                payload = json.loads(request.content)
+                events = b'{"type":"init","text":"' + b"e" * 32 + b'"}\n'
+                if payload.get("background") is not True:
+                    events += b'{"type":"execution_complete"}'
+                return httpx.Response(200, content=events)
+            return original(request)
+
+        self.service.client.close()
+        self.service.client = httpx.Client(transport=httpx.MockTransport(transport))
+        for background in (True, False, "omitted"):
+            with self.subTest(background=background):
+                payload = {"command": "sleep 30"}
+                if background != "omitted":
+                    payload["background"] = background
+                body = json.dumps(payload).encode()
+                downstream, peer = socket.socketpair()
+                try:
+                    handler = SimpleNamespace(
+                        path=f"/{sid}/command",
+                        command="POST",
+                        headers={"Content-Length": str(len(body))},
+                        rfile=io.BytesIO(body),
+                        wfile=io.BytesIO(),
+                        connection=downstream,
+                        send_response=lambda _: None,
+                        send_header=lambda *_: None,
+                        end_headers=lambda: None,
+                    )
+                    self.service.forward(handler)
+                finally:
+                    downstream.close()
+                    peer.close()
+        self.assertEqual(deletes, [])
+
+    def test_cancel_does_not_wait_for_ordinary_same_session_io(self):
+        sid, row, state, headers = self.cancel_fixture()
+        held = threading.Event()
+        release = threading.Event()
+
+        def ordinary_io():
+            with self.service._session_lock(sid):
+                held.set()
+                release.wait(5)
+
+        worker = threading.Thread(target=ordinary_io)
+        worker.start()
+        try:
+            self.assertTrue(held.wait(1))
+            before = time.monotonic()
+            with patch.object(
+                self.service,
+                "_cancel_request",
+                side_effect=[(200, {"createdAt": row[3]}), (200, None)],
+            ) as request:
+                self.service._cancel_foreground(sid, row, state, headers)
+            self.assertLess(time.monotonic() - before, 1.5)
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_args.args[2], "DELETE")
+            self.assertTrue(worker.is_alive())  # Ordinary I/O still holds its lock.
+        finally:
+            release.set()
+            worker.join(2)
+
+    def test_cancel_diagnostics_never_include_request_or_exception_data(self):
+        sid, row, state, headers = self.cancel_fixture()
+        module = "opensandbox_server.services.azure_service"
+        with (
+            patch.object(
+                self.service,
+                "_cancel_request",
+                side_effect=[
+                    (200, {"createdAt": row[3]}),
+                    httpx.ReadTimeout("sensitive-header-command-url-must-not-appear"),
+                ],
+            ),
+            self.assertLogs(module, level="INFO") as logs,
+        ):
+            self.service._cancel_foreground(sid, row, state, headers)
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            ["command_cancel.delete_dispatch", "command_cancel.transport_timeout"],
+        )
+        for record in logs.records:
+            self.assertFalse(record.exc_info)
+            self.assertEqual(record.args, ())
+
+    def disconnect_init_case(self, mode):
+        sid = self.service._create(self.request()).id
+        execution_id = "f" * 32
+        state = ForegroundCommand()
+        released = threading.Event()
+        written = threading.Event()
+        deletes = []
+        errors = []
+        owner = self
+        no_id = mode in ("missing", "oversized")
+
+        class InitStream(httpx.SyncByteStream):
+            def __iter__(self):
+                record = json.dumps({"type": "init", "text": execution_id}).encode()
+                if mode in ("header", "missing", "oversized"):
+                    owner.assertTrue(state.abandoned.wait(1))
+                if mode == "missing":
+                    yield b'{"type":"init","text":"'
+                elif mode == "oversized":
+                    yield b"x" * 256
+                elif mode == "unterminated":
+                    yield record
+                    raise httpx.ReadError("synthetic interruption after complete JSON")
+                elif mode == "write":
+                    yield record  # Complete JSON, no trailing newline, then broken pipe.
+                else:
+                    yield record[:10]
+                    owner.assertTrue(state.abandoned.wait(1))
+                    owner.assertFalse(released.is_set(), "closed before remaining init")
+                    yield record[10:]  # Fragmented init with no trailing newline.
+                owner.assertTrue(released.wait(2), "stream shutdown missing")
+
+            def close(self):
+                released.set()
+
+        class Writer(io.BytesIO):
+            def write(self, value):
+                written.set()
+                if mode == "write":
+                    raise BrokenPipeError("synthetic downstream failure")
+                return super().write(value)
+
+        original = self.transport
+
+        def transport(request):
+            if request.url.path == "/command" and request.method == "POST":
+                return httpx.Response(
+                    200,
+                    stream=InitStream(),
+                    extensions={
+                        "network_stream": SimpleNamespace(
+                            get_extra_info=lambda _: SimpleNamespace(
+                                shutdown=lambda _: released.set()
+                            )
+                        )
+                    },
+                )
+            if request.url.path == "/command" and request.method == "DELETE":
+                deletes.append(request)
+                return httpx.Response(200)
+            return original(request)
+
+        def end_headers():
+            if mode in ("header", "missing", "oversized"):
+                raise BrokenPipeError("synthetic header failure")
+
+        self.service.client.close()
+        self.service.client = httpx.Client(transport=httpx.MockTransport(transport))
+        downstream, peer = socket.socketpair()
+        body = b'{"command":"sleep 30","background":false}'
+        handler = SimpleNamespace(
+            path=f"/{sid}/command?id=unrelated",
+            command="POST",
+            headers={"Content-Length": str(len(body))},
+            rfile=io.BytesIO(body),
+            wfile=Writer(),
+            connection=downstream,
+            send_response=lambda _: None,
+            send_header=lambda *_: None,
+            end_headers=end_headers,
+        )
+
+        def run():
+            try:
+                self.service.forward(handler)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=run)
+        module = "opensandbox_server.services.azure_service."
+        try:
+            with (
+                patch(module + "ForegroundCommand", return_value=state),
+                patch(
+                    module + "COMMAND_INIT_DRAIN_SECONDS",
+                    0.2 if mode == "missing" else 2,
+                ),
+                patch(
+                    module + "COMMAND_INIT_DRAIN_BYTES",
+                    128 if mode == "oversized" else 128 * 1024,
+                ),
+            ):
+                worker.start()
+                if mode == "fragmented":
+                    self.assertTrue(written.wait(1))
+                    peer.close()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+            if mode == "unterminated":
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], httpx.ReadError)
+            else:
+                self.assertEqual(errors, [])
+            self.assertEqual(len(deletes), 0 if no_id else 1)
+            if deletes:
+                self.assertEqual(
+                    dict(deletes[0].url.params),
+                    {
+                        "identifier": sid,
+                        "api-version": "2025-02-02-preview",
+                        "id": execution_id,
+                    },
+                )
+            self.assertTrue(released.is_set())
+        finally:
+            released.set()
+            peer.close()
+            downstream.close()
+            worker.join(3)
+
+    def test_disconnect_reads_fragmented_init_before_interrupting(self):
+        self.disconnect_init_case("fragmented")
+
+    def test_failed_headers_still_read_delayed_init_and_cancel(self):
+        self.disconnect_init_case("header")
+
+    def test_write_failure_preserves_unterminated_complete_init(self):
+        self.disconnect_init_case("write")
+
+    def test_transport_failure_preserves_unterminated_complete_init(self):
+        self.disconnect_init_case("unterminated")
+
+    def test_missing_init_has_bounded_drain_without_broad_delete(self):
+        self.disconnect_init_case("missing")
+
+    def test_oversized_init_drain_stops_without_broad_delete(self):
+        self.disconnect_init_case("oversized")
+
+    def test_quiet_foreground_disconnect_interrupts_stream_and_cancels_exact_command(
+        self,
+    ):
+        sid = self.service._create(self.request()).id
+        execution_id = "d" * 32
+        released = threading.Event()
+        written = threading.Event()
+        deleted = threading.Event()
+        errors = []
+        owner = self
+
+        class QuietStream(httpx.SyncByteStream):
+            def __iter__(self):
+                yield (
+                    json.dumps({"type": "init", "text": execution_id}).encode() + b"\n"
+                )
+                if not released.wait(4):
+                    raise AssertionError("quiet upstream not interrupted")
+
+            def close(self):
+                released.set()
+
+        class Writer(io.BytesIO):
+            def write(self, value):
+                result = super().write(value)
+                written.set()
+                return result
+
+        original = self.transport
+
+        def transport(request):
+            if request.url.path == "/command" and request.method == "POST":
+                owner.assertEqual(request.headers["Connection"], "close")
+                return httpx.Response(
+                    200,
+                    stream=QuietStream(),
+                    extensions={
+                        "network_stream": SimpleNamespace(
+                            get_extra_info=lambda _: SimpleNamespace(
+                                shutdown=lambda _: released.set()
+                            )
+                        )
+                    },
+                )
+            if request.url.path == "/command" and request.method == "DELETE":
+                owner.assertEqual(
+                    dict(request.url.params),
+                    {
+                        "id": execution_id,
+                        "identifier": sid,
+                        "api-version": "2025-02-02-preview",
+                    },
+                )
+                deleted.set()
+                return httpx.Response(200)
+            return original(request)
+
+        self.service.client.close()
+        self.service.client = httpx.Client(transport=httpx.MockTransport(transport))
+        downstream, peer = socket.socketpair()
+        body = b'{"command":"sleep 30","background":false}'
+        handler = SimpleNamespace(
+            path=f"/{sid}/command?id=unrelated",
+            command="POST",
+            headers={"Content-Length": str(len(body))},
+            rfile=io.BytesIO(body),
+            wfile=Writer(),
+            connection=downstream,
+            send_response=lambda _: None,
+            send_header=lambda *_: None,
+            end_headers=lambda: None,
+        )
+
+        def run():
+            try:
+                self.service.forward(handler)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=run)
+        try:
+            worker.start()
+            self.assertTrue(written.wait(2))
+            peer.close()
+            self.assertTrue(deleted.wait(3))
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            released.set()
+            peer.close()
+            downstream.close()
+            worker.join(5)
 
 
 if __name__ == "__main__":

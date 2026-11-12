@@ -6,13 +6,16 @@ fixed; unsupported request semantics fail explicitly. Not an HA/tenant service.
 
 import asyncio
 import json
+import logging
 import hashlib
 import hmac
 import secrets
 import math
 import os
 import re
+import select
 import signal
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -40,6 +43,11 @@ MAX_BODY = 33 * 1024 * 1024
 # Keep the advertised absolute lease within the maximum Azure idle cooldown.
 MAX_LEASE = 60 * 60
 RUNTIME_CONTRACT = "workspace-command-files-v1"
+COMMAND_RECORD_LIMIT = 64 * 1024
+COMMAND_CANCEL_SECONDS = 2.0
+COMMAND_INIT_DRAIN_SECONDS = 2.0
+COMMAND_INIT_DRAIN_BYTES = 128 * 1024
+LOG = logging.getLogger(__name__)
 ALLOWED_PATHS = {
     "/ping",
     "/command",
@@ -71,6 +79,132 @@ def stream_timeout(remaining):
         write=setup_timeout,
         pool=setup_timeout,
     )
+
+
+def foreground_command(body):
+    """Match Go's boolean/default semantics without coercing false-like values."""
+    try:
+        request = json.loads(body)
+    except (ValueError, UnicodeError):
+        fail(400, "Invalid command request")
+    if not isinstance(request, dict) or (
+        "background" in request and type(request["background"]) is not bool
+    ):
+        fail(400, "Command background must be a boolean")
+    return request.get("background", False) is False
+
+
+class ForegroundCommand:
+    """Observe trusted execd framing before forwarding it; never parse stdout."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.execution_id = None
+        self.complete = False
+        self.abandoned = threading.Event()
+        self.finished = threading.Event()
+        self.pending = bytearray()
+        self.discard = False
+        self.invalid = False
+        self.cancel_started = False
+        self.changed = threading.Event()
+        self.drain_deadline = None
+        self.drain_bytes = 0
+
+    def abandon(self):
+        with self.lock:
+            if not self.abandoned.is_set():
+                self.drain_deadline = time.monotonic() + COMMAND_INIT_DRAIN_SECONDS
+                self.drain_bytes = len(self.pending)
+                self.abandoned.set()
+            # A complete JSON init may already be buffered without a newline.
+            self._record()
+            self.changed.set()
+
+    def drain_done(self):
+        with self.lock:
+            return (
+                self.execution_id is not None
+                or self.complete
+                or self.invalid
+                or self.drain_bytes >= COMMAND_INIT_DRAIN_BYTES
+                or (
+                    self.drain_deadline is not None
+                    and time.monotonic() >= self.drain_deadline
+                )
+            )
+
+    def feed(self, chunk):
+        with self.lock:
+            if self.abandoned.is_set():
+                self.drain_bytes += len(chunk)
+            for index, part in enumerate(chunk.split(b"\n")):
+                if index:
+                    self._record()
+                    self.pending.clear()
+                    self.discard = False
+                if not self.discard:
+                    if len(self.pending) + len(part) > COMMAND_RECORD_LIMIT:
+                        self.pending.clear()
+                        self.discard = True
+                    else:
+                        self.pending.extend(part)
+            if self.abandoned.is_set():
+                self._record()
+            self.changed.set()
+
+    def _record(self):
+        if self.discard:
+            return
+        line = bytes(self.pending).strip()
+        if not line or line.startswith(b":"):
+            return
+        if line.startswith(b"data:"):
+            line = line[5:].strip()
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            return
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == "init":
+            value = event.get("text")
+            if (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{32}", value) is None
+                or self.execution_id not in (None, value)
+            ):
+                self.invalid = True
+                self.execution_id = None
+            elif not self.invalid:
+                self.execution_id = value
+        elif event.get("type") in ("execution_complete", "error"):
+            self.complete = True
+
+    def cancel_id(self):
+        with self.lock:
+            if self.abandoned.is_set() and not self.complete and not self.invalid:
+                return self.execution_id
+        return None
+
+    def end_of_stream(self):
+        with self.lock:
+            self._record()
+            self.pending.clear()
+
+
+def interrupt_stream(response):
+    """Interrupt only this HTTP/1 stream, not the shared client/connection pool."""
+    if response.is_closed:
+        return
+    network = response.extensions.get("network_stream")
+    if network is not None:
+        transport = network.get_extra_info("socket")
+        if transport is not None:
+            try:
+                transport.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 class AzureSandboxService(SandboxService, ExtensionService):
@@ -105,6 +239,18 @@ class AzureSandboxService(SandboxService, ExtensionService):
         )
         self.client = client or httpx.Client(
             timeout=45, follow_redirects=False, trust_env=False
+        )
+        # Reserve transport capacity for cleanup, independent of ordinary file
+        # and command requests. An injected client remains the offline transport.
+        self.cancel_client = (
+            httpx.Client(
+                timeout=0.25,
+                follow_redirects=False,
+                trust_env=False,
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=0),
+            )
+            if client is None
+            else None
         )
         self.lock = threading.RLock()
         self.session_locks = {}
@@ -744,6 +890,155 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 headers={"OpenSandbox-Secure-Access": row[5]} if row[5] else None,
             )
 
+    def _cancel_request(
+        self, sid, path, method, headers, deadline, *, execution_id=None
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Command cancellation deadline exceeded")
+        params = {"identifier": sid, "api-version": API_VERSION}
+        if execution_id is not None:
+            params["id"] = execution_id
+        # Do not inherit query selectors, request headers, or caller credentials.
+        # Short phase limits also bound waiting for the response headers; the
+        # watchdog interrupts a stalled/dripping body after headers arrive.
+        client = self.cancel_client if self.cancel_client is not None else self.client
+        with client.stream(
+            method,
+            self.pool + path,
+            params=params,
+            headers={**headers, "Connection": "close"},
+            content=b"",
+            timeout=httpx.Timeout(min(0.25, remaining / 4)),
+        ) as response:
+            timer = threading.Timer(
+                max(0, deadline - time.monotonic()), interrupt_stream, args=(response,)
+            )
+            timer.daemon = True
+            timer.start()
+            try:
+                if execution_id is not None:
+                    return response.status_code, None
+                payload = bytearray()
+                for chunk in response.iter_bytes():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Command cancellation deadline exceeded")
+                    payload.extend(chunk)
+                    if len(payload) > COMMAND_RECORD_LIMIT:
+                        raise ValueError("Oversized generation response")
+                return response.status_code, json.loads(payload)
+            finally:
+                timer.cancel()
+                timer.join(timeout=0.1)
+
+    def _cancel_foreground(self, sid, original, state, headers):
+        """Best-effort exact command cancellation, never session retirement."""
+        with state.lock:
+            if state.cancel_started or state.cancel_id() is None:
+                return
+        deadline = time.monotonic() + COMMAND_CANCEL_SECONDS
+        try:
+
+            def still_owned():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self.lock.acquire(timeout=remaining):
+                    return False
+                try:
+                    self._require_leader()
+                    current = self._row(sid)
+                    return (
+                        current[1] > time.time()
+                        and bool(original[3])
+                        and current[3:8] == original[3:8]
+                        and current[7] == RUNTIME_CONTRACT
+                        and json.loads(current[0]).get("image", {}).get("uri")
+                        == self.image
+                    )
+                finally:
+                    self.lock.release()
+
+            execution_id = state.cancel_id()
+            if execution_id is None or not still_owned():
+                LOG.info("command_cancel.binding_rejected")
+                return
+            status, generation = self._cancel_request(
+                sid, "/.management/getSession", "POST", headers, deadline
+            )
+            if (
+                status != 200
+                or not isinstance(generation, dict)
+                or generation.get("createdAt") != original[3]
+                or not still_owned()
+            ):
+                LOG.info("command_cancel.generation_or_binding_rejected")
+                return
+            # Completion and cancellation dispatch have a single ordering. The
+            # reader marks terminal events before writing them downstream.
+            with state.lock:
+                if state.cancel_started or state.cancel_id() != execution_id:
+                    return
+                # Claim only at dispatch. The ordinary session I/O lock is not
+                # acquired: slow file/status requests must not strand cleanup.
+                # The old bound token plus exact execution ID fences this
+                # DELETE even if retirement races the final generation check.
+                state.cancel_started = True
+                LOG.info("command_cancel.delete_dispatch")
+                status, _ = self._cancel_request(
+                    sid,
+                    "/command",
+                    "DELETE",
+                    headers,
+                    deadline,
+                    execution_id=execution_id,
+                )
+                LOG.info(
+                    "command_cancel.delete_accepted"
+                    if status == 200
+                    else "command_cancel.delete_rejected"
+                )
+        except (httpx.TimeoutException, TimeoutError):
+            LOG.info("command_cancel.transport_timeout")
+        except (HTTPException, httpx.HTTPError, OSError, ValueError):
+            # Never log URLs/headers or broaden an unsuccessful exact DELETE.
+            LOG.info("command_cancel.validation_or_transport_failed")
+
+    def _watch_foreground(self, handler, response, state, sid, row, headers):
+        try:
+            while not state.finished.is_set():
+                if state.abandoned.is_set():
+                    break
+                try:
+                    ready, _, _ = select.select([handler.connection], [], [], 0.05)
+                    if not ready:
+                        continue
+                    if handler.connection.recv(
+                        1, socket.MSG_PEEK | socket.MSG_DONTWAIT
+                    ):
+                        state.finished.wait(0.05)
+                        continue
+                except BlockingIOError:
+                    continue
+                except (OSError, ValueError):
+                    pass
+                LOG.info("command_cancel.downstream_disconnect_observed")
+                state.abandon()
+                break
+            if not state.abandoned.is_set():
+                return
+            # Keep the one reader alive through a fragmented/delayed init.
+            # Never discard the only exact cancellation ID at downstream EOF.
+            while not state.finished.is_set() and not state.drain_done():
+                state.changed.wait(0.05)
+                state.changed.clear()
+            # Closing alone is not proof Azure cancelled its upstream request.
+            interrupt_stream(response)
+            if state.cancel_id() is not None:
+                self._cancel_foreground(sid, row, state, headers)
+            elif not state.complete:
+                LOG.info("command_cancel.init_unavailable")
+        finally:
+            state.finished.set()
+
     def forward(self, handler):
         url = urlsplit(handler.path)
         parts = url.path.split("/", 2)
@@ -775,7 +1070,10 @@ class AzureSandboxService(SandboxService, ExtensionService):
         if not 0 <= length <= MAX_BODY:
             fail(413, "Request too large")
         body = handler.rfile.read(length)
-        with self._session_lock(sid):
+        streaming = path == "/command" and handler.command == "POST"
+        foreground = streaming and foreground_command(body)
+        session_lock = self._session_lock(sid)
+        with session_lock:
             self._require_leader()
             row = self._live(sid)
             remaining = row[1] - time.time()
@@ -795,6 +1093,10 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 token = row[4]
             headers = self._headers()
             headers["X-EXECD-ACCESS-TOKEN"] = token
+            if foreground:
+                # Watchdogs own this socket through teardown: it must never
+                # return to the pool for another sandbox/request in that race.
+                headers["Connection"] = "close"
             if handler.headers.get("Range"):
                 byte_range = handler.headers["Range"]
                 if not re.fullmatch(r"bytes=\d+-\d*", byte_range):
@@ -814,10 +1116,30 @@ class AzureSandboxService(SandboxService, ExtensionService):
             # Serialize only this sandbox until Azure acknowledges the request;
             # unrelated sessions remain available during cold allocation calls.
             response = stream.__enter__()
+        state = (
+            ForegroundCommand() if foreground and response.status_code == 200 else None
+        )
+        watcher = None
         try:
+            if state is not None:
+                watcher = threading.Thread(
+                    target=self._watch_foreground,
+                    args=(
+                        handler,
+                        response,
+                        state,
+                        sid,
+                        row,
+                        {
+                            key: headers[key]
+                            for key in ("Authorization", "X-EXECD-ACCESS-TOKEN")
+                        },
+                    ),
+                    daemon=True,
+                )
+                watcher.start()
             # Buffer file/control replies before sending success, so size/deadline
             # failures cannot turn a partial download into an apparent HTTP 200.
-            streaming = path == "/command" and handler.command == "POST"
             payload = bytearray()
             if not streaming:
                 for chunk in response.iter_bytes():
@@ -833,31 +1155,87 @@ class AzureSandboxService(SandboxService, ExtensionService):
                     and len(payload) != int(expected_length)
                 ):
                     fail(502, "Sandbox returned an incomplete transfer")
-            handler.send_response(response.status_code)
-            handler.send_header(
-                "Content-Type",
-                response.headers.get("Content-Type", "application/octet-stream"),
-            )
-            if not streaming:
-                handler.send_header("Content-Length", str(len(payload)))
-                for header in ("Content-Range", "Accept-Ranges", "Content-Disposition"):
-                    if header in response.headers:
-                        handler.send_header(header, response.headers[header])
-            handler.send_header("Connection", "close")
-            handler.end_headers()
+            try:
+                handler.send_response(response.status_code)
+                handler.send_header(
+                    "Content-Type",
+                    response.headers.get("Content-Type", "application/octet-stream"),
+                )
+                if not streaming:
+                    handler.send_header("Content-Length", str(len(payload)))
+                    for header in (
+                        "Content-Range",
+                        "Accept-Ranges",
+                        "Content-Disposition",
+                    ):
+                        if header in response.headers:
+                            handler.send_header(header, response.headers[header])
+                handler.send_header("Connection", "close")
+                handler.end_headers()
+            except OSError:
+                if state is None:
+                    raise
+                LOG.info("command_cancel.downstream_header_write_failed")
+                state.abandon()
             if not streaming:
                 handler.wfile.write(payload)
             else:
                 size = 0
                 for chunk in response.iter_bytes():
+                    if state is not None:
+                        state.feed(chunk)
+                        if state.abandoned.is_set():
+                            if state.drain_done() or state.finished.is_set():
+                                return
+                            continue
                     size += len(chunk)
                     if size > MAX_BODY or time.time() >= row[1]:
                         # No execution_complete event is emitted on interruption.
                         handler.close_connection = True
                         return
-                    handler.wfile.write(chunk)
-                    handler.wfile.flush()
+                    try:
+                        handler.wfile.write(chunk)
+                        handler.wfile.flush()
+                    except OSError:
+                        if state is None:
+                            raise
+                        LOG.info("command_cancel.downstream_body_write_failed")
+                        state.abandon()
+                if state is not None:
+                    state.end_of_stream()
+        except (OSError, httpx.HTTPError):
+            if state is not None:
+                state.abandon()
+            raise
         finally:
+            if state is not None:
+                # Also parse a complete unterminated record on interruption.
+                state.end_of_stream()
+                # EOF/size limits without a terminal record abandon this
+                # foreground stream too; a normal terminal event never cancels.
+                with state.lock:
+                    if not state.complete:
+                        state.abandon()
+                if not state.abandoned.is_set():
+                    state.finished.set()
+                if watcher is not None:
+                    watcher.join(
+                        timeout=COMMAND_INIT_DRAIN_SECONDS
+                        + COMMAND_CANCEL_SECONDS
+                        + 0.5
+                    )
+                # An init already buffered at EOF can be parsed just after the
+                # watcher sees disconnect. Claim cancellation once, including
+                # that ordering, without retrying a previous DELETE attempt.
+                self._cancel_foreground(
+                    sid,
+                    row,
+                    state,
+                    {
+                        key: headers[key]
+                        for key in ("Authorization", "X-EXECD-ACCESS-TOKEN")
+                    },
+                )
             stream.__exit__(None, None, None)
 
     def _unsupported(self, *_args, **_kwargs):
@@ -896,6 +1274,8 @@ class AzureSandboxService(SandboxService, ExtensionService):
         if self.leadership_thread is not None:
             self.leadership_thread.join(timeout=5)
         self.client.close()
+        if self.cancel_client is not None:
+            self.cancel_client.close()
         self.credential.close()
         self.db.close()
 
