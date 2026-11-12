@@ -13,10 +13,12 @@ RUN gofmt -w main.go pkg/flag/flags.go pkg/flag/parser.go pkg/web/controller/ini
  && go get golang.org/x/net@v0.62.0 \
  && go test -timeout 120s ./pkg/web/controller -run 'TestOneShot|TestApply' \
  && CGO_ENABLED=0 go build -trimpath -ldflags "-X github.com/alibaba/opensandbox/internal/version.Version=skills156-init-once -X github.com/alibaba/opensandbox/internal/version.GitCommit=b7d7697750b45be2ccc876da645c8880a0cf69fc+opsrabbit-init-once -X github.com/alibaba/opensandbox/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o /execd .
-FROM python:3.12-slim-trixie@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends bubblewrap ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && useradd -u 1000 -m sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace
+FROM python:3.12-alpine3.23@sha256:20d13dc88e7bc1adf6e18cdddeb4cd53a7e0fdc3825bfe05f00c7563d4cdf102
+RUN apk upgrade --no-cache && apk add --no-cache bubblewrap bash coreutils ca-certificates \
+ && adduser -D -u 1000 sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace \
+ && cp -a /bin/. /usr/bin/ && cp -a /lib/. /usr/lib/
+# The command worker mounts /usr and maps /bin and /lib into it. Preserve
+# Alpine's original package files and provide its binaries/loader in that view.
 COPY --from=execd /execd /opt/execd
 COPY runtime-start.py runtime-gateway.py /opt/
 RUN mkdir -p /opt/opsrabbit-system/identity \

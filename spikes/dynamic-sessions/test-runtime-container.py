@@ -119,6 +119,10 @@ def main(image):
         command = (
             "test ! -e /proc/self/environ && test ! -e /etc/passwd && "
             'test -z "$IDENTITY_ENDPOINT" && ! touch /usr/forbidden 2>/dev/null && '
+            "bash -c 'items=(one two); test ${#items[@]} -eq 2' && "
+            "python -c 'import csv, json, ssl, sqlite3; assert sqlite3.sqlite_version' && "
+            "test \"$(printf abc | sha256sum | cut -d' ' -f1)\" = "
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad && "
             "printf generated-by-command > /workspace/generated.txt && printf isolation-ok"
         )
         status, body = request(

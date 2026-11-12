@@ -1,8 +1,12 @@
-FROM docker.io/opensandbox/server:release-1.1.1@sha256:bcd5f264101262cebfa7e1ff9cd0424403e42f31a6596e4364cf90d8cb5c936b
-USER root
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
-RUN /usr/local/bin/python -m pip --python /app/.venv/bin/python install --no-cache-dir 'azure-identity==1.25.1' 'certifi==2026.10.23' 'oauthlib==4.0.1' 'psycopg[binary]==3.3.8'
-RUN /usr/local/bin/python -m pip install --no-cache-dir 'setuptools==84.2.1'
+FROM python:3.12-alpine3.23@sha256:20d13dc88e7bc1adf6e18cdddeb4cd53a7e0fdc3825bfe05f00c7563d4cdf102
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
+COPY requirements-server.txt /tmp/requirements-server.txt
+RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r /tmp/requirements-server.txt \
+ && mkdir -p /app \
+ && python -c 'import importlib.util, shutil; shutil.copytree(importlib.util.find_spec("opensandbox_server").submodule_search_locations[0], "/app/opensandbox_server")' \
+ && addgroup -g 10001 opensandbox && adduser -D -u 10001 -G opensandbox opensandbox
+ENV PYTHONPATH=/app
+WORKDIR /app
 COPY patch-server.py /tmp/patch-server.py
 RUN python /tmp/patch-server.py
 COPY azure_service.py /app/opensandbox_server/services/azure_service.py
