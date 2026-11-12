@@ -128,6 +128,18 @@ cp terraform.tfvars.example terraform.tfvars
 Replace every placeholder. Use the immutable image digests from the approved
 OpsRabbit release manifest.
 
+Check PostgreSQL sizes for the selected region before the bootstrap apply:
+
+```bash
+az postgres flexible-server list-skus --location "<azure-region>" --output json
+```
+
+Set `postgresql_sku_name` to an appropriate available size. The default is
+`B_Standard_B1ms`, but Azure can reject a listed size with `SkuNotAvailable`
+when provisioning. If that happens, choose another available size, review its
+cost, and create a new Terraform plan. Preserve resources already created by
+the bootstrap apply; do not destroy the installation to retry database creation.
+
 ### Container platform
 
 Azure Container Instances remains the default:
@@ -504,7 +516,10 @@ The helper attaches BuildKit SBOM and provenance attestations, pushes amd64
 images to the customer ACR, prints immutable digests for Terraform, scans both
 images with Trivy before publishing, and fails on High or Critical findings,
 including findings without a vendor fix. Skopeo is required to publish the
-scanned OCI layouts with their attestations. Both final image layers use
+scanned OCI layouts with their attestations. The helper authenticates Skopeo
+directly with a short-lived ACR token through standard input. Its private
+temporary auth file is removed on exit, so publication does not depend on
+Docker Desktop's credential store. Both final image layers use
 digest-pinned Python on Alpine 3.24; the OpenSandbox server dependency tree is
 hash-locked. Review the exact commit's JSON image scan artifacts in CI and
 qualify the final image digests on Azure before customer release. The minimal
@@ -514,8 +529,10 @@ contains the generated OpenSandbox API key and restricted database password,
 so use encrypted remote state with limited access.
 
 The operator building/publishing these images also needs `Container Registry
-Repository Writer` on the ACR, conditioned separately to
-`opsrabbit/opensandbox-server` and `opsrabbit/opensandbox-runtime`. Do not grant
+Repository Writer` on the ACR, with a condition allowing only
+`opsrabbit/opensandbox-server` or `opsrabbit/opensandbox-runtime`. Use one role
+assignment with both repository names in its condition; Azure does not create
+separate assignments for the same principal, role, and registry scope. Do not grant
 this write role to either runtime identity. The installer gives the deployed
 server and session pool only repository-scoped Reader access after their image
 digests are configured.
