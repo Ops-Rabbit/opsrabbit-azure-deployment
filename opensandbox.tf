@@ -95,13 +95,11 @@ resource "azurerm_role_assignment" "opensandbox_acr_pull" {
 
 resource "azurerm_role_assignment" "opensandbox_runtime_acr_pull" {
   count                            = local.opensandbox_enabled ? 1 : 0
-  scope                            = azurerm_container_registry.opsrabbit.id
+  scope                            = azurerm_container_registry.opensandbox_runtime.id
   role_definition_name             = "Container Registry Repository Reader"
   principal_id                     = azurerm_user_assigned_identity.opensandbox_runtime_pull[0].principal_id
   principal_type                   = "ServicePrincipal"
   skip_service_principal_aad_check = true
-  condition                        = local.acr_opensandbox_runtime_reader_condition
-  condition_version                = "2.0"
 }
 
 resource "azapi_resource" "opensandbox_pool_image_pull" {
@@ -124,7 +122,7 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
       customContainerTemplate = {
         containers = [{
           name  = "runtime"
-          image = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
+          image = local.opensandbox_runtime_image
           resources = {
             cpu    = 0.5
             memory = "1Gi"
@@ -133,7 +131,7 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
         ingress = { targetPort = 8080 }
         registryCredentials = {
           identity = azurerm_user_assigned_identity.opensandbox_runtime_pull[0].id
-          server   = azurerm_container_registry.opsrabbit.login_server
+          server   = azurerm_container_registry.opensandbox_runtime.login_server
         }
       }
       dynamicPoolConfiguration = {
@@ -165,6 +163,7 @@ resource "azapi_resource" "opensandbox_pool_image_pull" {
 
   depends_on = [
     azurerm_role_assignment.opensandbox_runtime_acr_pull,
+    azurerm_private_endpoint.opensandbox_runtime_registry,
     azapi_update_resource.acr_repository_mode,
     time_sleep.acr_role_propagation,
   ]
@@ -254,7 +253,7 @@ resource "azapi_resource" "opensandbox" {
             { name = "OPENSANDBOX_API_KEY", secretRef = "opensandbox-api-key" },
             { name = "AZURE_SESSION_DATABASE_URL", secretRef = "opensandbox-session-database-url" },
             { name = "AZURE_CLIENT_ID", value = azurerm_user_assigned_identity.opensandbox[0].client_id },
-            { name = "AZURE_SESSION_IMAGE", value = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}" },
+            { name = "AZURE_SESSION_IMAGE", value = local.opensandbox_runtime_image },
             { name = "AZURE_SESSION_ENDPOINT", value = azapi_resource.opensandbox_pool_image_pull[0].output.properties.poolManagementEndpoint },
             { name = "AZURE_SESSION_MAX_SESSIONS", value = tostring(var.opensandbox_max_sessions) },
             { name = "OPENSANDBOX_CREDENTIAL_GENERATION", value = random_id.opensandbox_credential_revision[0].hex },

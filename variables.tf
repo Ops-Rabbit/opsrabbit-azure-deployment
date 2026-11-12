@@ -178,6 +178,22 @@ variable "container_registry_name" {
   }
 }
 
+variable "opensandbox_runtime_registry_name" {
+  description = "Globally unique ACR reserved only for sandbox runtime images. Defaults to a deterministic name derived from container_registry_name."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.opensandbox_runtime_registry_name == null || can(regex("^[a-z0-9]{5,50}$", var.opensandbox_runtime_registry_name))
+    error_message = "opensandbox_runtime_registry_name must contain 5-50 lowercase alphanumeric characters."
+  }
+
+  validation {
+    condition     = var.opensandbox_runtime_registry_name == null || try(var.opensandbox_runtime_registry_name != lower(var.container_registry_name), false)
+    error_message = "The sandbox runtime registry must be different from the application registry."
+  }
+}
+
 variable "storage_account_name" {
   description = "Globally unique Azure Storage account name."
   type        = string

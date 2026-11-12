@@ -8,6 +8,7 @@ variables {
   location                          = "eastus2"
   resource_group_name               = "rg-opsrabbit-test"
   container_registry_name           = "opsrabbittestacr"
+  opensandbox_runtime_registry_name = "opsrabbittestruntime"
   storage_account_name              = "opsrabbitteststorage"
   postgresql_server_name            = "pg-opsrabbit-test"
   postgresql_administrator_password = "test postgres+password"
@@ -37,6 +38,15 @@ override_resource {
   values = {
     id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestacr"
     login_server = "opsrabbittestacr.azurecr.io"
+  }
+}
+
+override_resource {
+  target          = azurerm_container_registry.opensandbox_runtime
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestruntime"
+    login_server = "opsrabbittestruntime.azurecr.io"
   }
 }
 
@@ -285,6 +295,18 @@ run "use_existing_resource_group" {
 
 run "private_application_topology" {
   command = plan
+
+  assert {
+    condition = (
+      azurerm_container_registry.opensandbox_runtime.sku == "Premium" &&
+      !azurerm_container_registry.opensandbox_runtime.public_network_access_enabled &&
+      length(azurerm_private_endpoint.opensandbox_runtime_registry) == 1 &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_service_connection[0].private_connection_resource_id == azurerm_container_registry.opensandbox_runtime.id &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_dns_zone_group[0].private_dns_zone_ids == tolist([var.private_network.acr_private_dns_zone_id])
+    )
+    error_message = "Private deployments must give the separate runtime registry its own private endpoint and DNS records."
+  }
+
 
   override_resource {
     target          = azurerm_private_dns_zone.opensandbox_environment[0]

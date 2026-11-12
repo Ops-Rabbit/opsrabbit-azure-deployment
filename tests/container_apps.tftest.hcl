@@ -9,6 +9,7 @@ variables {
   location                          = "eastus2"
   resource_group_name               = "rg-opsrabbit-test"
   container_registry_name           = "opsrabbittestacr"
+  opensandbox_runtime_registry_name = "opsrabbittestruntime"
   storage_account_name              = "opsrabbitteststorage"
   postgresql_server_name            = "pg-opsrabbit-test"
   postgresql_administrator_password = join("", [for _ in range(16) : "p"])
@@ -40,6 +41,15 @@ override_resource {
   values = {
     id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestacr"
     login_server = "opsrabbittestacr.azurecr.io"
+  }
+}
+
+override_resource {
+  target          = azurerm_container_registry.opensandbox_runtime
+  override_during = plan
+  values = {
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.ContainerRegistry/registries/opsrabbittestruntime"
+    login_server = "opsrabbittestruntime.azurecr.io"
   }
 }
 
@@ -241,7 +251,7 @@ run "complete_public_aca_topology" {
       random_id.container_app_revision[0].keepers.opensandbox_bootstrap == sha512(jsonencode([
         local.opensandbox_controller_origin,
         var.opensandbox_server_image_digest,
-        var.opensandbox_runtime_image_digest,
+        local.opensandbox_runtime_image,
         var.opensandbox_max_sessions,
       ])) &&
       length([
@@ -289,7 +299,7 @@ run "complete_public_aca_topology" {
       strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/backend") &&
       strcontains(azurerm_role_assignment.acr_repository_reader.condition, "opsrabbit/web") &&
       time_sleep.acr_role_propagation.create_duration == "5m" &&
-      time_sleep.acr_role_propagation.triggers.opensandbox_runtime_acl == local.acr_opensandbox_runtime_reader_condition
+      time_sleep.acr_role_propagation.triggers.opensandbox_runtime_registry == azurerm_container_registry.opensandbox_runtime.id
     )
     error_message = "ACR must retain legacy pull access until it has switched after assigning repository-scoped reader access."
   }
@@ -356,6 +366,18 @@ run "complete_public_aca_topology" {
 
 run "complete_private_aca_topology" {
   command = plan
+
+  assert {
+    condition = (
+      azurerm_container_registry.opensandbox_runtime.sku == "Premium" &&
+      !azurerm_container_registry.opensandbox_runtime.public_network_access_enabled &&
+      length(azurerm_private_endpoint.opensandbox_runtime_registry) == 1 &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_service_connection[0].private_connection_resource_id == azurerm_container_registry.opensandbox_runtime.id &&
+      azurerm_private_endpoint.opensandbox_runtime_registry[0].private_dns_zone_group[0].private_dns_zone_ids == tolist([var.private_network.acr_private_dns_zone_id])
+    )
+    error_message = "Private deployments must give the separate runtime registry its own private endpoint and DNS records."
+  }
+
 
   override_resource {
     target          = azurerm_private_dns_zone.opensandbox_environment[0]
@@ -766,4 +788,68 @@ run "reject_invalid_container_app_name" {
   expect_failures = [
     var.container_app_name,
   ]
+}
+
+run "runtime_registry_access_boundary" {
+  command = plan
+  variables {
+    application_enabled = true
+  }
+  override_resource {
+    target          = random_password.opensandbox_api_key[0]
+    override_during = plan
+    values          = { result = "synthetic-runtime-registry-test-only" }
+  }
+  assert {
+    condition = (
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].scope == azurerm_container_registry.opensandbox_runtime.id &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].scope != azurerm_container_registry.opsrabbit.id &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].condition == null &&
+      azurerm_role_assignment.opensandbox_runtime_acr_pull[0].role_definition_name == "Container Registry Repository Reader" &&
+      azurerm_role_assignment.opensandbox_acr_pull[0].scope == azurerm_container_registry.opsrabbit.id &&
+      azurerm_role_assignment.acr_repository_reader.scope == azurerm_container_registry.opsrabbit.id
+    )
+    error_message = "Runtime Reader access must be limited to the separate runtime registry, never the application registry."
+  }
+  assert {
+    condition = (
+      azurerm_container_registry.opensandbox_runtime.sku == "Basic" &&
+      azurerm_container_registry.opensandbox_runtime.role_assignment_mode == "AbacRepositoryPermissions" &&
+      !azurerm_container_registry.opensandbox_runtime.admin_enabled &&
+      !azurerm_container_registry.opensandbox_runtime.anonymous_pull_enabled &&
+      length(azurerm_private_endpoint.opensandbox_runtime_registry) == 0 &&
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.managedIdentitySettings[0].lifecycle == "None"
+    )
+    error_message = "Public QA runtime storage must remain authenticated, without exposing its identity to sandbox code."
+  }
+  assert {
+    condition = (
+      local.opensandbox_runtime_image == "opsrabbittestruntime.azurecr.io/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}" &&
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.customContainerTemplate.containers[0].image == local.opensandbox_runtime_image &&
+      azapi_resource.opensandbox_pool_image_pull[0].body.properties.customContainerTemplate.registryCredentials.server == azurerm_container_registry.opensandbox_runtime.login_server &&
+      jsondecode(local.opensandbox_bootstrap_json).image == local.opensandbox_runtime_image &&
+      one([for entry in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : entry.value if entry.name == "AZURE_SESSION_IMAGE"]) == local.opensandbox_runtime_image
+    )
+    error_message = "The pool, controller and product bootstrap must use the same immutable image in the runtime-only registry."
+  }
+}
+
+run "reject_shared_application_runtime_registry" {
+  command = plan
+  variables {
+    opensandbox_runtime_registry_name = "opsrabbittestacr"
+  }
+  expect_failures = [var.opensandbox_runtime_registry_name]
+}
+
+run "runtime_registry_default_handles_long_names" {
+  command = plan
+  variables {
+    container_registry_name           = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWX"
+    opensandbox_runtime_registry_name = null
+  }
+  assert {
+    condition     = can(regex("^[a-z0-9]{5,50}$", azurerm_container_registry.opensandbox_runtime.name)) && azurerm_container_registry.opensandbox_runtime.name != lower(var.container_registry_name)
+    error_message = "Derived runtime registry names must remain valid and distinct for maximum-length application registry names."
+  }
 }

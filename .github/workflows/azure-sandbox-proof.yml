@@ -33,6 +33,10 @@ jobs:
           /tmp/proof-lint/bin/pip install ruff==0.14.8
           /tmp/proof-lint/bin/ruff check spikes/dynamic-sessions
           /tmp/proof-lint/bin/ruff format --check spikes/dynamic-sessions
+      - name: Verify isolated registry publication and scan gate
+        run: |
+          bash -n spikes/dynamic-sessions/build-azure-images.sh
+          python3 spikes/dynamic-sessions/test_image_publisher.py
       - name: Build pinned OpenSandbox server with Azure adapter
         run: docker build -t opensandbox-azure-proof:ci -f spikes/dynamic-sessions/Dockerfile.server spikes/dynamic-sessions
       - name: Adapter contract tests without network access

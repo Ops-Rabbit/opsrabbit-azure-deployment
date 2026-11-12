@@ -110,7 +110,7 @@ resource "random_id" "container_app_revision" {
     opensandbox_bootstrap = local.opensandbox_enabled ? sha512(jsonencode([
       local.opensandbox_controller_origin,
       var.opensandbox_server_image_digest,
-      var.opensandbox_runtime_image_digest,
+      local.opensandbox_runtime_image,
       var.opensandbox_max_sessions,
     ])) : "disabled"
   }

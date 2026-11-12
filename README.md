@@ -6,7 +6,7 @@ or use an existing customer-owned group.
 
 - Azure Container Registry, using Basic for public mode or Premium with a
   private endpoint for private mode
-- separate controller and image-pull identities with repository-scoped ACR Reader roles
+- separate controller and image-pull identities; a dedicated ACR for sandbox runtimes
 - Azure Files shares for application data and Git workspaces, restricted to the
   selected compute subnet in private mode
 - Azure Database for PostgreSQL Flexible Server 16
@@ -168,13 +168,24 @@ VNet-accessible to both private ACA and private ACI workloads without a public
 endpoint. In a public environment, the controller ingress is public and
 protected by the API key. The controller's execution identity receives only
 `Azure ContainerApps Session Executor` on the exact pool. Separate identities
-pull the OpenSandbox server and runtime images, each with read access to its
-single repository. Their identity tokens are unavailable to the controller
+pull the OpenSandbox server and runtime images. The server identity can read
+only its repository in the application ACR. The runtime identity can read only
+a second ACR reserved exclusively for sandbox runtime images; it has no grant
+on the application ACR. Their identity tokens are unavailable to the controller
 process and sandbox workload. The session pool denies egress and exposes no
 managed identity to workload containers.
 
-Terraform enables ACR's RBAC plus ABAC repository mode after it assigns the
-installer identities' repository-scoped Reader roles. Legacy `AcrPull`,
+The separate runtime ACR is required because the validated Dynamic Sessions
+image-pull path rejected repository-conditioned Reader grants. Its Reader role
+has no repository condition, so **do not store application images, customer
+images, or other unrelated artifacts in this registry**. The registry itself is
+the access boundary. It adds a second Basic ACR in public mode, or a second
+Premium ACR and private endpoint in private mode. Set
+`opensandbox_runtime_registry_name` to choose its globally unique name; when
+omitted, Terraform derives a distinct name from `container_registry_name`.
+
+Terraform enables the application ACR's RBAC plus ABAC repository mode after
+it assigns the application/server identities' repository-scoped Reader roles. Legacy `AcrPull`,
 `AcrPush`, and `AcrDelete` assignments stop granting data access in that mode.
 For an existing customer-managed registry, migrate any external identity roles
 before changing the mode. Azure's [ACR ABAC migration guidance](https://learn.microsoft.com/azure/container-registry/container-registry-rbac-abac-repository-permissions)
@@ -415,7 +426,7 @@ terraform apply bootstrap.tfplan
 rm -f bootstrap.tfplan
 ```
 
-The bootstrap apply creates ACR, PostgreSQL, `vector`, Azure Files, the managed
+The bootstrap apply creates both ACRs, PostgreSQL, `vector`, Azure Files, the managed
 identity, and the ACA environment when selected. It does not create the
 application workload.
 
@@ -424,6 +435,7 @@ private addresses from the Terraform runner:
 
 ```bash
 nslookup "$(terraform output -raw container_registry_login_server)"
+nslookup "$(terraform output -raw opensandbox_runtime_registry_login_server)"
 nslookup "$(terraform output -raw postgresql_host)"
 ```
 
@@ -509,11 +521,12 @@ workspace runtime. Build them from this checkout after the bootstrap apply:
 chmod +x spikes/dynamic-sessions/build-azure-images.sh
 spikes/dynamic-sessions/build-azure-images.sh \
   "$(terraform output -raw container_registry_name)" \
+  "$(terraform output -raw opensandbox_runtime_registry_name)" \
   "<unique-build-tag>"
 ```
 
 The helper attaches BuildKit SBOM and provenance attestations, pushes amd64
-images to the customer ACR, prints immutable digests for Terraform, scans both
+images to their separate customer ACRs, prints immutable digests for Terraform, scans both
 images with Trivy before publishing, and fails on High or Critical findings,
 including findings without a vendor fix. Skopeo is required to publish the
 scanned OCI layouts with their attestations. The helper authenticates Skopeo
@@ -528,14 +541,14 @@ browser automation are not qualified. Terraform state
 contains the generated OpenSandbox API key and restricted database password,
 so use encrypted remote state with limited access.
 
-The operator building/publishing these images also needs `Container Registry
-Repository Writer` on the ACR, with a condition allowing only
-`opsrabbit/opensandbox-server` or `opsrabbit/opensandbox-runtime`. Use one role
-assignment with both repository names in its condition; Azure does not create
-separate assignments for the same principal, role, and registry scope. Do not grant
-this write role to either runtime identity. The installer gives the deployed
-server and session pool only repository-scoped Reader access after their image
-digests are configured.
+The operator building/publishing these images needs temporary `Container
+Registry Repository Writer` grants: one on the application ACR conditioned to
+`opsrabbit/opensandbox-server`, and one on the runtime ACR conditioned to
+`opsrabbit/opensandbox-runtime`. Remove those publishing grants after verifying
+the destination digests. Do not grant write access to either deployed identity.
+The server gets repository-scoped Reader access in the application ACR; the
+session pool gets Reader access only on the dedicated runtime ACR. The helper
+rejects identical registry names so it cannot silently mix the two image types.
 
 Set the two printed digest values in `terraform.tfvars`:
 
@@ -652,6 +665,32 @@ Expected health response:
 ```json
 {"ok":true,"service":"opsrabbit-node-backend","role":"all"}
 ```
+
+## Moving from the single-registry preview
+
+Keep existing workloads and state. Before applying the new runtime image
+location, create only the new registry (and its endpoint in private mode):
+
+```bash
+terraform plan -target=azurerm_container_registry.opensandbox_runtime \
+  -target=azurerm_private_endpoint.opensandbox_runtime_registry \
+  -out=runtime-registry.tfplan
+terraform show runtime-registry.tfplan
+terraform apply runtime-registry.tfplan
+```
+
+This targeted bootstrap is only for migrating the earlier preview. Publish or
+copy the already verified runtime image and attestations to the dedicated
+registry, then verify its digest. Generate and review a normal, untargeted plan
+before continuing. It must remove the runtime identity's grant on the
+application registry and grant read access only on the new registry. Never
+move unrelated application images into the runtime registry.
+
+For an existing active OpsRabbit installation, reconcile its sandbox image
+setting through the administrator workflow as part of the migration. Bootstrap
+stops on a conflicting active configuration instead of silently overwriting it.
+Do not set `application_enabled=false` to migrate a running installation; that
+would plan removal of its workloads.
 
 ## Upgrades
 

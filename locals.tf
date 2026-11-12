@@ -5,6 +5,11 @@ locals {
   container_app_enabled   = local.application_enabled && var.deployment_target == "aca"
   opensandbox_enabled     = local.application_enabled
   resource_group_id       = "/subscriptions/${var.subscription_id}/resourceGroups/${var.resource_group_name}"
+  opensandbox_runtime_registry_name = coalesce(
+    var.opensandbox_runtime_registry_name,
+    "${substr(lower(var.container_registry_name), 0, 35)}${substr(sha256(lower(var.container_registry_name)), 0, 8)}runtime",
+  )
+  opensandbox_runtime_image = var.opensandbox_runtime_image_digest == null ? null : "${azurerm_container_registry.opensandbox_runtime.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
 
   compute_subnet_id = local.private_network_enabled ? (
     var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null)
@@ -35,12 +40,11 @@ locals {
   backend_image_repository = var.backend_image_repository != null ? var.backend_image_repository : (
     var.deployment_target == "aca" ? "opsrabbit/backend" : "opsrabbit/backend-aci"
   )
-  acr_repository_reader_action_guard       = "(!(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/content/read'}) AND !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/metadata/read'}))"
-  acr_application_reader_condition         = "(${local.acr_repository_reader_action_guard} OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '${local.backend_image_repository}' OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '${var.web_image_repository}'))"
-  acr_opensandbox_server_reader_condition  = "(${local.acr_repository_reader_action_guard} OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase 'opsrabbit/opensandbox-server')"
-  acr_opensandbox_runtime_reader_condition = "(${local.acr_repository_reader_action_guard} OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase 'opsrabbit/opensandbox-runtime')"
-  backend_image                            = "${azurerm_container_registry.opsrabbit.login_server}/${local.backend_image_repository}@${var.backend_image_digest}"
-  web_image                                = "${azurerm_container_registry.opsrabbit.login_server}/${var.web_image_repository}@${var.web_image_digest}"
+  acr_repository_reader_action_guard      = "(!(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/content/read'}) AND !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/metadata/read'}))"
+  acr_application_reader_condition        = "(${local.acr_repository_reader_action_guard} OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '${local.backend_image_repository}' OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '${var.web_image_repository}'))"
+  acr_opensandbox_server_reader_condition = "(${local.acr_repository_reader_action_guard} OR @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase 'opsrabbit/opensandbox-server')"
+  backend_image                           = "${azurerm_container_registry.opsrabbit.login_server}/${local.backend_image_repository}@${var.backend_image_digest}"
+  web_image                               = "${azurerm_container_registry.opsrabbit.login_server}/${var.web_image_repository}@${var.web_image_digest}"
 
   backend_healthcheck_command = "node -e \"fetch('http://127.0.0.1:8384/health').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))\""
 
@@ -51,13 +55,13 @@ locals {
   opensandbox_bootstrap_json = local.opensandbox_enabled ? jsonencode({
     endpoint = local.opensandbox_controller_origin
     apiKey   = random_password.opensandbox_api_key[0].result
-    image    = "${azurerm_container_registry.opsrabbit.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
+    image    = local.opensandbox_runtime_image
   }) : null
 
   opensandbox_bootstrap_revision = local.opensandbox_enabled ? sha256(jsonencode({
-    server_digest  = var.opensandbox_server_image_digest
-    runtime_digest = var.opensandbox_runtime_image_digest
-    max_sessions   = var.opensandbox_max_sessions
+    server_digest = var.opensandbox_server_image_digest
+    runtime_image = local.opensandbox_runtime_image
+    max_sessions  = var.opensandbox_max_sessions
   })) : null
 
   opensandbox_bootstrap_command = local.opensandbox_enabled ? join(" && ", [

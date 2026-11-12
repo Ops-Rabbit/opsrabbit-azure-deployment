@@ -18,6 +18,21 @@ output "backend_image" {
   value       = local.backend_image
 }
 
+output "opensandbox_runtime_registry_name" {
+  description = "Dedicated registry reserved exclusively for sandbox runtime images."
+  value       = azurerm_container_registry.opensandbox_runtime.name
+}
+
+output "opensandbox_runtime_registry_login_server" {
+  description = "Authenticated image endpoint for the dedicated sandbox runtime registry."
+  value       = azurerm_container_registry.opensandbox_runtime.login_server
+}
+
+output "opensandbox_runtime_image" {
+  description = "Immutable runtime image shared by the pool, controller and OpsRabbit bootstrap."
+  value       = local.opensandbox_runtime_image
+}
+
 output "backend_image_repository" {
   description = "Resolved backend repository inside the customer ACR."
   value       = local.backend_image_repository

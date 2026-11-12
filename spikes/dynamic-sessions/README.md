@@ -41,8 +41,11 @@ entrypoints instead of silently running an arbitrary caller-provided command.
 
 The controller uses a dedicated user-assigned managed identity with Session
 Executor at the exact pool scope. A separate image-pull identity has only
-`Container Registry Repository Reader`, scoped to the exact proof image
-repository, and pool identity lifecycle `None`. No controller key or
+`Container Registry Repository Reader` on a dedicated runtime-only ACR, and
+pool identity lifecycle `None`. The customer installer separates this registry
+from the application/controller ACR because live Dynamic Sessions image pulls
+rejected repository-conditioned Reader grants. Store only runtime images in
+that dedicated registry. No controller key or
 Azure access token is forwarded into the execution container or returned in
 endpoint metadata.
 

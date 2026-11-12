@@ -136,12 +136,12 @@ resource "azurerm_role_assignment" "acr_repository_reader" {
 resource "time_sleep" "acr_role_propagation" {
   create_duration = "5m"
   triggers = {
-    application_assignment  = azurerm_role_assignment.acr_repository_reader.id
-    application_condition   = local.acr_application_reader_condition
-    opensandbox_server      = local.opensandbox_enabled ? azurerm_role_assignment.opensandbox_acr_pull[0].id : "disabled"
-    opensandbox_server_acl  = local.opensandbox_enabled ? local.acr_opensandbox_server_reader_condition : "disabled"
-    opensandbox_runtime     = local.opensandbox_enabled ? azurerm_role_assignment.opensandbox_runtime_acr_pull[0].id : "disabled"
-    opensandbox_runtime_acl = local.opensandbox_enabled ? local.acr_opensandbox_runtime_reader_condition : "disabled"
+    application_assignment       = azurerm_role_assignment.acr_repository_reader.id
+    application_condition        = local.acr_application_reader_condition
+    opensandbox_server           = local.opensandbox_enabled ? azurerm_role_assignment.opensandbox_acr_pull[0].id : "disabled"
+    opensandbox_server_acl       = local.opensandbox_enabled ? local.acr_opensandbox_server_reader_condition : "disabled"
+    opensandbox_runtime          = local.opensandbox_enabled ? azurerm_role_assignment.opensandbox_runtime_acr_pull[0].id : "disabled"
+    opensandbox_runtime_registry = azurerm_container_registry.opensandbox_runtime.id
   }
 
   depends_on = [
