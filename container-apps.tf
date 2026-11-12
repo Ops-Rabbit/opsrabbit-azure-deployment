@@ -201,6 +201,10 @@ resource "azurerm_container_app" "opsrabbit" {
           secret_name = "opsrabbit-encryption-key"
         }
         env {
+          name        = "BETTER_AUTH_SECRET"
+          secret_name = "better-auth-secret"
+        }
+        env {
           name  = "NODE_ENV"
           value = "production"
         }

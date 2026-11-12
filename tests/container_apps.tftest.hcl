@@ -279,6 +279,14 @@ run "complete_public_aca_topology" {
 
   assert {
     condition = length([
+      for env in azurerm_container_app.opsrabbit[0].template[0].init_container[0].env : env
+      if env.name == "BETTER_AUTH_SECRET" && env.secret_name == "better-auth-secret" && (env.value == null || env.value == "")
+    ]) == 1
+    error_message = "The production bootstrap CLI requires the existing auth secret through an ACA secret reference."
+  }
+
+  assert {
+    condition = length([
       for setting in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : setting
       if setting.name == "OPENSANDBOX_CREDENTIAL_GENERATION" && setting.value == random_id.opensandbox_credential_revision[0].hex
     ]) == 1

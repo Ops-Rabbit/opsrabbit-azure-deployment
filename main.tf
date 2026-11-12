@@ -405,6 +405,7 @@ resource "azurerm_container_group" "opsrabbit" {
       secure_environment_variables = {
         OPSRABBIT_NODE_DATABASE_URL   = local.postgresql_database_url
         OPSRABBIT_NODE_ENCRYPTION_KEY = var.opsrabbit_encryption_key
+        BETTER_AUTH_SECRET            = var.better_auth_secret
         OPENSANDBOX_BOOTSTRAP_JSON    = local.opensandbox_bootstrap_json
       }
     }

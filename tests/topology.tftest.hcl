@@ -209,6 +209,14 @@ run "complete_application_topology" {
   }
 
   assert {
+    condition = (
+      azurerm_container_group.opsrabbit[0].init_container[0].secure_environment_variables["BETTER_AUTH_SECRET"] == var.better_auth_secret &&
+      !contains(keys(azurerm_container_group.opsrabbit[0].init_container[0].environment_variables), "BETTER_AUTH_SECRET")
+    )
+    error_message = "The production bootstrap CLI requires the existing auth secret only in secure ACI environment variables."
+  }
+
+  assert {
     condition     = azurerm_container_group.opsrabbit[0].init_container[0].environment_variables["OPENSANDBOX_BOOTSTRAP_REVISION"] == local.opensandbox_bootstrap_revision
     error_message = "ACI must rerun verify-before-enable bootstrap when OpenSandbox server/runtime digests or session capacity change."
   }
