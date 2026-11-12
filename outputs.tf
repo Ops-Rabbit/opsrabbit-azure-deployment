@@ -74,13 +74,13 @@ output "container_app_environment_name" {
 }
 
 output "container_app_name" {
-  description = "Azure Container App name, or null until the ACA workload is enabled."
-  value       = local.container_app_enabled ? azurerm_container_app.opsrabbit[0].name : null
+  description = "Azure Container App name, or null until the ACA workload is created."
+  value       = local.container_app_enabled ? try(azurerm_container_app.opsrabbit[0].name, null) : null
 }
 
 output "container_app_fqdn" {
-  description = "Azure Container App ingress FQDN, or null until the ACA workload is enabled."
-  value       = local.container_app_enabled ? azurerm_container_app.opsrabbit[0].ingress[0].fqdn : null
+  description = "Azure Container App ingress FQDN, or null until the ACA workload is created."
+  value       = local.container_app_enabled ? try(azurerm_container_app.opsrabbit[0].ingress[0].fqdn, null) : null
 }
 
 output "opsrabbit_url" {

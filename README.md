@@ -586,6 +586,12 @@ terraform apply deployment.tfplan
 rm -f deployment.tfplan
 ```
 
+If an Azure operation fails partway through the apply, keep the state and the
+resources that were created successfully. Resolve the reported error, then
+generate and review a fresh plan before retrying. Do not reuse a plan that was
+already partially applied. The application name and hostname remain null if
+you refresh state before the application has been created.
+
 ## 8. Verify the deployment
 
 ```bash
