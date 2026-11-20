@@ -1,5 +1,10 @@
 # OpsRabbit Azure Terraform
 
+For **Azure Kubernetes Service (AKS)**, use the separate
+[`aks/` installation guide](aks/README.md). It provisions AKS, private ACR and
+PostgreSQL, and deploys OpsRabbit with Helm. The Terraform configuration in this
+repository's root continues to manage Container Apps and Container Instances.
+
 This package creates the Azure resources for a fresh OpsRabbit deployment. It
 supports public or private networking and can create a dedicated resource group
 or use an existing customer-owned group.

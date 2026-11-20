@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opsrabbit.fullname" . }}-backend
+  labels:
+    {{- include "opsrabbit.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.backend.servicePort }}
+      targetPort: http
+  selector:
+    {{- include "opsrabbit.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opsrabbit.fullname" . }}-web
+  labels:
+    {{- include "opsrabbit.labels" . | nindent 4 }}
+  annotations:
+    {{- with (omit .Values.service.annotations "service.beta.kubernetes.io/azure-load-balancer-internal") }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    service.beta.kubernetes.io/azure-load-balancer-internal: {{ .Values.service.internal | quote }}
+spec:
+  type: LoadBalancer
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: https
+      port: 443
+      targetPort: https
+  selector:
+    {{- include "opsrabbit.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web

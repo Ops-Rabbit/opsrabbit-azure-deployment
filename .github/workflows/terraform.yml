@@ -51,3 +51,44 @@ jobs:
 
       - name: Run TFLint
         run: tflint --recursive
+
+  aks:
+    name: AKS infrastructure and Helm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+      - name: Install Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v4.3.0
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with:
+          tflint_version: v0.64.0
+      - name: Initialize AKS Terraform without backend
+        run: terraform -chdir=aks init -backend=false -input=false -lockfile=readonly
+      - name: Validate AKS configuration and mocked plans
+        run: |
+          terraform fmt -check -recursive aks
+          terraform -chdir=aks validate -no-color
+          terraform -chdir=aks test -no-color
+          tflint --chdir=aks
+      - name: Install chart test dependency
+        run: |
+          python3 -m venv /tmp/aks-test-venv
+          /tmp/aks-test-venv/bin/pip install -r aks/tests/requirements.txt
+      - name: Validate rendered Helm manifests
+        run: |
+          helm lint aks/chart --strict -f aks/values.example.yaml
+          /tmp/aks-test-venv/bin/python -m unittest discover -s aks/tests -p 'test_*.py' -v
+          bash -n aks/scripts/sync-runtime-secret.sh
