@@ -11,3 +11,6 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+__pycache__/
+aks/values.local.yaml
+aks/.local/

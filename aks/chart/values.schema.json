@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "applicationOrigin": {
+      "type": "string",
+      "pattern": "^https://[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$"
+    },
+    "replicaCount": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "const": 1
+        },
+        "web": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "subdirectories": {
+          "const": [
+            ".opsrabbit",
+            "git",
+            ".agent-browser",
+            ".codex"
+          ]
+        },
+        "accessModes": {
+          "const": [
+            "ReadWriteOnce"
+          ]
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "properties": {
+        "containerPort": {
+          "const": 8384
+        },
+        "servicePort": {
+          "const": 8384
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "DATABASE_URL",
+                "OPSRABBIT_NODE_DATABASE_URL",
+                "BETTER_AUTH_SECRET",
+                "OPSRABBIT_NODE_ENCRYPTION_KEY",
+                "NODE_ENV",
+                "OPSRABBIT_NODE_HOST",
+                "OPSRABBIT_NODE_PORT",
+                "OPSRABBIT_NODE_DATA_DIR",
+                "OPSRABBIT_NODE_WORKSPACE_DIR",
+                "OPSRABBIT_WEB_ORIGIN",
+                "OPSRABBIT_NODE_BASE_URL"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "web": {
+      "type": "object",
+      "properties": {
+        "containerPort": {
+          "const": 8080
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "VITE_API_URL",
+                "WEB_TLS_MODE",
+                "WEB_TLS_REDIRECT",
+                "WEB_SERVER_NAME",
+                "WEB_TLS_CERT_FILE",
+                "WEB_TLS_KEY_FILE",
+                "WEB_API_UPSTREAM"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "automountServiceAccountToken": {
+          "const": false
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$"
+        },
+        "web": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$"
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1
+        },
+        "databaseUrlKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "betterAuthSecretKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "encryptionKeyKey": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acmeChallengeConfigMap": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

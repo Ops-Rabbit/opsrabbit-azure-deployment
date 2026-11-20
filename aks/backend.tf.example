@@ -1,0 +1,9 @@
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "replace-state-resource-group"
+    storage_account_name = "replacestatestoragename"
+    container_name       = "tfstate"
+    key                  = "opsrabbit-aks.tfstate"
+    use_azuread_auth     = true
+  }
+}

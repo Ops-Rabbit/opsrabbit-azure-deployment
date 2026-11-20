@@ -1,0 +1,16 @@
+{{- if gt (int .Values.replicaCount.web) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "opsrabbit.fullname" . }}-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "opsrabbit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "opsrabbit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+{{- end }}

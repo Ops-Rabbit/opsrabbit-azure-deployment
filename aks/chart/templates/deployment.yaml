@@ -1,0 +1,337 @@
+{{- $root := . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opsrabbit.fullname" . }}-backend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "opsrabbit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "opsrabbit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        {{- include "opsrabbit.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: backend
+    spec:
+      terminationGracePeriodSeconds: 135
+      serviceAccountName: {{ include "opsrabbit.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: backend
+          image: {{ required "image.backend is required" .Values.image.backend | quote }}
+          imagePullPolicy: {{ include "opsrabbit.imagePullPolicy" (dict "value" .Values.backend.imagePullPolicy "Values" .Values) }}
+          securityContext:
+            {{- toYaml .Values.backend.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.containerPort }}
+              protocol: TCP
+          {{- with .Values.backend.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.backend.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opsrabbit.secretName" . }}
+                  key: {{ .Values.secrets.databaseUrlKey }}
+            - name: OPSRABBIT_NODE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opsrabbit.secretName" . }}
+                  key: {{ .Values.secrets.databaseUrlKey }}
+            - name: BETTER_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opsrabbit.secretName" . }}
+                  key: {{ .Values.secrets.betterAuthSecretKey }}
+            - name: OPSRABBIT_NODE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opsrabbit.secretName" . }}
+                  key: {{ .Values.secrets.encryptionKeyKey }}
+            - name: NODE_ENV
+              value: production
+            - name: OPSRABBIT_NODE_HOST
+              value: "0.0.0.0"
+            - name: OPSRABBIT_NODE_PORT
+              value: "8384"
+            - name: OPSRABBIT_NODE_DATA_DIR
+              value: /home/opsbot/.opsrabbit
+            - name: OPSRABBIT_NODE_WORKSPACE_DIR
+              value: /home/opsbot/git
+            - name: OPSRABBIT_WEB_ORIGIN
+              value: {{ required "applicationOrigin is required" .Values.applicationOrigin | quote }}
+            - name: OPSRABBIT_NODE_BASE_URL
+              value: {{ printf "%s/api" .Values.applicationOrigin | quote }}
+            {{- range $name, $value := .Values.backend.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          {{- with .Values.resources.backend }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.persistence.enabled }}
+          volumeMounts:
+            {{- range .Values.persistence.subdirectories }}
+            - name: app-data
+              mountPath: {{ printf "/home/opsbot/%s" . | quote }}
+              subPath: {{ . | quote }}
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+          {{- end }}
+          {{- if not .Values.persistence.enabled }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          {{- end }}
+      {{- if .Values.persistence.enabled }}
+      initContainers:
+        - name: backend-storage
+          image: {{ .Values.image.backend | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /persistent/.opsrabbit /persistent/git /persistent/.agent-browser /persistent/.codex
+              # The PVC hides the image's browser discovery link. Restore only
+              # missing image defaults; never replace an existing user profile.
+              if [ ! -e /persistent/.agent-browser/browsers ] && [ ! -L /persistent/.agent-browser/browsers ]; then
+                if [ -d /opt/opsrabbit-agent-browser/browsers ]; then
+                  ln -s /opt/opsrabbit-agent-browser/browsers /persistent/.agent-browser/browsers
+                fi
+              fi
+              if [ ! -e /persistent/.agent-browser/config.json ] && [ ! -L /persistent/.agent-browser/config.json ]; then
+                if [ -f /home/opsbot/.agent-browser/config.json ]; then
+                  cp /home/opsbot/.agent-browser/config.json /persistent/.agent-browser/config.json
+                fi
+              fi
+          resources:
+            {{- toYaml .Values.resources.backend | nindent 12 }}
+          volumeMounts:
+            - name: app-data
+              mountPath: /persistent
+      {{- end }}
+      {{- if .Values.persistence.enabled }}
+      volumes:
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: {{ default (include "opsrabbit.fullname" .) .Values.persistence.existingClaim }}
+        - name: tmp
+          emptyDir: {}
+      {{- else }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- end }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opsrabbit.fullname" . }}-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "opsrabbit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.replicaCount.web }}
+  selector:
+    matchLabels:
+      {{- include "opsrabbit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        {{- include "opsrabbit.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      serviceAccountName: {{ include "opsrabbit.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.web.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: web
+          image: {{ required "image.web is required" .Values.image.web | quote }}
+          imagePullPolicy: {{ include "opsrabbit.imagePullPolicy" (dict "value" .Values.web.imagePullPolicy "Values" .Values) }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.web.containerPort }}
+              protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          {{- with .Values.web.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.web.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: VITE_API_URL
+              value: /api
+            - name: WEB_TLS_MODE
+              value: both
+            - name: WEB_TLS_REDIRECT
+              value: "true"
+            - name: WEB_SERVER_NAME
+              value: {{ trimPrefix "https://" .Values.applicationOrigin | quote }}
+            - name: WEB_TLS_CERT_FILE
+              value: /etc/nginx/certs/tls.crt
+            - name: WEB_TLS_KEY_FILE
+              value: /etc/nginx/certs/tls.key
+            - name: WEB_API_UPSTREAM
+              value: http://{{ include "opsrabbit.fullname" . }}-backend:{{ .Values.backend.servicePort }}
+            {{- range $name, $value := .Values.web.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /
+              port: https
+              scheme: HTTPS
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: https
+              scheme: HTTPS
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          {{- with .Values.resources.web }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: web-html
+              mountPath: /usr/share/nginx/html
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: nginx-templates
+              mountPath: /etc/nginx/templates
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+            - name: tls
+              mountPath: /etc/nginx/certs
+              readOnly: true
+            {{- if .Values.tls.acmeChallengeConfigMap }}
+            - name: acme-challenges
+              mountPath: /usr/share/nginx/html/.well-known/acme-challenge
+              readOnly: true
+            {{- end }}
+      initContainers:
+        - name: web-assets
+          image: {{ required "image.web is required" .Values.image.web | quote }}
+          imagePullPolicy: {{ include "opsrabbit.imagePullPolicy" (dict "value" .Values.web.imagePullPolicy "Values" .Values) }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              cp -R /usr/share/nginx/html/. /mnt/web-html/
+              cp -R /etc/nginx/templates/. /mnt/nginx-templates/
+              for template in /mnt/nginx-templates/*.template; do
+                sed -i -e 's/listen 80;/listen {{ .Values.web.containerPort }};/g' \
+                  -e 's/listen \[::\]:80;/listen [::]:{{ .Values.web.containerPort }};/g' \
+                  -e 's/listen 443 ssl;/listen 8443 ssl;/g' \
+                  -e 's/listen \[::\]:443 ssl;/listen [::]:8443 ssl;/g' "$template"
+              done
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources.web | nindent 12 }}
+          volumeMounts:
+            - name: web-html
+              mountPath: /mnt/web-html
+            - name: nginx-templates
+              mountPath: /mnt/nginx-templates
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: web-html
+          emptyDir: {}
+        - name: nginx-conf
+          emptyDir: {}
+        - name: nginx-templates
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: {{ required "tls.existingSecret is required" .Values.tls.existingSecret }}
+        {{- if .Values.tls.acmeChallengeConfigMap }}
+        - name: acme-challenges
+          configMap:
+            name: {{ .Values.tls.acmeChallengeConfigMap }}
+        {{- end }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
