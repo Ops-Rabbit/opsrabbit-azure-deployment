@@ -1,7 +1,9 @@
 """execd APIs launch with the minimum filesystem view each endpoint needs."""
 
 import importlib.util
+import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -170,13 +172,15 @@ class WorkspaceCommandTests(unittest.TestCase):
         }
         request = self.request(command="$(touch /tmp/parent)", envs=envs)
         with (
-            patch.object(sys, "argv", ["workspace-command.py", json.dumps(request)]),
+            patch.object(sys, "argv", ["workspace-command.py", "--request-fd", "3"]),
+            patch.object(self.launcher, "read_request", return_value=request) as read,
             patch.object(self.launcher.os, "execve") as execute,
             patch.object(self.launcher.os, "open", return_value=7) as opened,
             patch.object(self.launcher.os, "set_inheritable") as inherited,
             patch.object(self.launcher.os, "close") as closed,
         ):
             self.launcher.main()
+        read.assert_called_once_with(3)
         opened.assert_called_once_with(
             self.launcher.NAMESPACE_FILTER,
             self.launcher.os.O_RDONLY | self.launcher.os.O_NOFOLLOW,
@@ -200,6 +204,63 @@ class WorkspaceCommandTests(unittest.TestCase):
         mounts = [args[i : i + 3] for i in range(len(args) - 2)]
         self.assertIn(["--setenv", "LD_PRELOAD", "/workspace/evil.so"], mounts)
         self.assertIn(["--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin"], mounts)
+
+    def test_large_envelope_descriptor_closes_without_consuming_stdin(self):
+        request = self.request(envs={"PAD_A": "a" * 71680, "PAD_B": "b" * 71680})
+        payload = json.dumps(request).encode()
+        self.assertGreater(len(payload), 128 * 1024)
+        with tempfile.TemporaryFile() as envelope:
+            envelope.write(payload)
+            envelope.seek(0)
+            fd = os.dup(envelope.fileno())
+            with patch.object(sys, "stdin", io.StringIO("stdin-canary")):
+                self.assertEqual(self.launcher.read_request(fd), request)
+                self.assertEqual(sys.stdin.read(), "stdin-canary")
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_invalid_envelope_closes_descriptor(self):
+        with tempfile.TemporaryFile() as envelope:
+            envelope.write(b"not-json")
+            envelope.seek(0)
+            fd = os.dup(envelope.fileno())
+            with self.assertRaises(ValueError):
+                self.launcher.read_request(fd)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_envelope_failure_never_opens_filter_or_executes(self):
+        for error in (ValueError("bad json"), OSError("closed fd")):
+            with (
+                self.subTest(error=type(error)),
+                patch.object(
+                    sys, "argv", ["workspace-command.py", "--request-fd", "3"]
+                ),
+                patch.object(self.launcher, "read_request", side_effect=error),
+                patch.object(self.launcher.os, "open") as opened,
+                patch.object(self.launcher.os, "execve") as execute,
+                self.assertRaisesRegex(SystemExit, "invalid workspace command request"),
+            ):
+                self.launcher.main()
+            opened.assert_not_called()
+            execute.assert_not_called()
+
+    def test_launcher_rejects_argv_payload_and_stdio_descriptors(self):
+        for args in (
+            [json.dumps(self.request())],
+            ["--request-fd", "0"],
+            ["--request-fd", "1"],
+            ["--request-fd", "2"],
+            ["--request-fd", "3", "extra"],
+        ):
+            with (
+                self.subTest(args=args),
+                patch.object(sys, "argv", ["workspace-command.py", *args]),
+                patch.object(self.launcher, "read_request") as read,
+                self.assertRaises(SystemExit),
+            ):
+                self.launcher.main()
+            read.assert_not_called()
 
     def test_native_argv_is_not_evaluated_or_resolved_in_parent(self):
         argv = ["/workspace/tool", "$(id)", "--proc", "/proc"]
@@ -233,9 +294,8 @@ class WorkspaceCommandTests(unittest.TestCase):
 
     def test_filter_failure_never_executes_payload(self):
         with (
-            patch.object(
-                sys, "argv", ["workspace-command.py", json.dumps(self.request())]
-            ),
+            patch.object(sys, "argv", ["workspace-command.py", "--request-fd", "3"]),
+            patch.object(self.launcher, "read_request", return_value=self.request()),
             patch.object(self.launcher.os, "open", side_effect=FileNotFoundError),
             patch.object(self.launcher.os, "execve") as execute,
             self.assertRaises(FileNotFoundError),

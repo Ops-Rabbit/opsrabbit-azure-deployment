@@ -191,16 +191,27 @@ def command_args(request, seccomp_fd):
     return args + ["--chdir", cwd, "--", *child]
 
 
+def read_request(fd):
+    # execd owns this unlinked, seekable file. Consume and close it before
+    # opening any descriptor that will cross exec into bwrap. Never use stdin.
+    with os.fdopen(fd, "rb") as stream:
+        return json.load(stream)
+
+
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("workspace launcher requires one request envelope")
+    if sys.argv[1:] != ["--request-fd", "3"]:
+        raise SystemExit("workspace launcher requires the inherited request fd")
+    try:
+        request = read_request(3)
+    except (ValueError, TypeError, OSError):
+        raise SystemExit("invalid workspace command request") from None
     # The root-owned filter lives on the supervisor's immutable /opt mount.
     # Only this descriptor crosses exec; bwrap installs it after setup and
     # closes it before running the payload. Failure has no unfiltered fallback.
     fd = os.open(NAMESPACE_FILTER, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         try:
-            args = command_args(json.loads(sys.argv[1]), fd)
+            args = command_args(request, fd)
         except (ValueError, TypeError):
             raise SystemExit("invalid workspace command request") from None
         os.set_inheritable(fd, True)

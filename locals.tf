@@ -9,6 +9,8 @@ locals {
     var.opensandbox_runtime_registry_name,
     "${substr(lower(var.container_registry_name), 0, 35)}${substr(sha256(lower(var.container_registry_name)), 0, 8)}runtime",
   )
+  # Plan-known ARM identity changes when a replacement pool gets a new name.
+  opensandbox_pool_id       = "${local.resource_group_id}/providers/Microsoft.App/sessionPools/${var.opensandbox_pool_name}"
   opensandbox_runtime_image = var.opensandbox_runtime_image_digest == null ? null : "${azurerm_container_registry.opensandbox_runtime.login_server}/opsrabbit/opensandbox-runtime@${var.opensandbox_runtime_image_digest}"
 
   compute_subnet_id = local.private_network_enabled ? (
@@ -52,10 +54,16 @@ locals {
 
   opensandbox_database_url = local.opensandbox_enabled ? "postgresql://${urlencode(postgresql_role.opensandbox[0].name)}:${replace(urlencode(random_password.opensandbox_database[0].result), "+", "%20")}@${azurerm_postgresql_flexible_server.opsrabbit.fqdn}:5432/${replace(urlencode(var.postgresql_database_name), "+", "%20")}?sslmode=require" : null
 
+  opensandbox_lifecycle_limits = {
+    idleHours  = 1
+    maxAgeDays = 1
+  }
+
   opensandbox_bootstrap_json = local.opensandbox_enabled ? jsonencode({
-    endpoint = local.opensandbox_controller_origin
-    apiKey   = random_password.opensandbox_api_key[0].result
-    image    = local.opensandbox_runtime_image
+    endpoint        = local.opensandbox_controller_origin
+    apiKey          = random_password.opensandbox_api_key[0].result
+    image           = local.opensandbox_runtime_image
+    lifecycleLimits = local.opensandbox_lifecycle_limits
     resourceLimits = {
       cpu    = "0.5"
       memory = "1g"
@@ -66,12 +74,14 @@ locals {
     server_digest = var.opensandbox_server_image_digest
     runtime_image = local.opensandbox_runtime_image
     max_sessions  = var.opensandbox_max_sessions
+    lifecycle     = local.opensandbox_lifecycle_limits
+    pool_id       = local.opensandbox_pool_id
   })) : null
 
   opensandbox_bootstrap_command = local.opensandbox_enabled ? join(" && ", [
     "until nc -z \"$POSTGRES_HOST\" 5432; do sleep 2; done",
     "set -o pipefail",
-    "node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --capabilities | node -e 'let s=\"\"; process.stdin.on(\"data\", c => s+=c); process.stdin.on(\"end\", () => { try { const c=JSON.parse(s); process.exit(c.activation===true && c.verification===true && c.install===true && c.resourceLimits===true && c.contractVersion===1 ? 0 : 1); } catch { process.exit(1); } });'",
+    "node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --capabilities | node -e 'let s=\"\"; process.stdin.on(\"data\", c => s+=c); process.stdin.on(\"end\", () => { try { const c=JSON.parse(s); process.exit(c.activation===true && c.verification===true && c.install===true && c.resourceLimits===true && c.lifecycleLimits===true && c.contractVersion===1 ? 0 : 1); } catch { process.exit(1); } });'",
     "node /opt/opsrabbit/apps/backend/dist/scripts/db-migrate.js",
     "printf '%s' \"$OPENSANDBOX_BOOTSTRAP_JSON\" | node /opt/opsrabbit/apps/backend/dist/scripts/initialize-opensandbox.js --install",
   ]) : null

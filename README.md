@@ -586,6 +586,14 @@ Azure session pool; the product's generic defaults are not used for this pool.
 Older builds without this capability stop before migration rather than saving
 an incompatible configuration.
 
+The backend must also advertise `lifecycleLimits: true`. The installer supplies
+`idleHours: 1` and `maxAgeDays: 1`, and verifies and saves that same policy. The
+controller accepts leases of 60–3600 seconds; a session cannot be renewed beyond
+one hour from creation. OpsRabbit retires and replaces an allocation when its
+lease can no longer cover an operation. Session files are temporary. Existing
+settings with different lifecycle limits require explicit administrator
+reconciliation; bootstrap does not overwrite them.
+
 The Azure runtime enforces a fresh workspace-only boundary for every command.
 Its controller advertises the versioned `workspace-command-files-v1` contract
 only after the approved runtime confirms it. OpsRabbit checks that authenticated
@@ -594,11 +602,12 @@ command execution. Legacy runtimes retain the product's existing wrapper.
 Browser execution remains unavailable for this command/file runtime.
 
 Changes to the controller endpoint, server or runtime image digest, session
-limit, or generated credentials create new ACA revisions. The application
+pool identity, session limit, lifecycle policy, or generated credentials create
+new ACA revisions. The application
 revision reruns the installer bootstrap; the controller revision reloads its
 credentials. For ACI, a non-secret bootstrap revision fingerprint replaces the
-container group and reruns verification when the controller/runtime digest or
-session limit changes. During a single-revision controller rollout, the new
+container group and reruns verification when the controller/runtime digest,
+pool identity, session limit, or lifecycle policy changes. During a single-revision controller rollout, the new
 process waits for the PostgreSQL leader lock before reconciling sessions.
 Requests can briefly return HTTP 503 while the old controller stops and the new
 one recovers the journal.
@@ -710,8 +719,9 @@ replacement also needs a new name because Azure cannot create two pools with
 the same name.
 
 For an existing active OpsRabbit installation, reconcile its sandbox image
-setting through the administrator workflow as part of the migration. Bootstrap
-stops on a conflicting active configuration instead of silently overwriting it.
+setting **before the application is replaced**, using the upgrade procedure
+below. Bootstrap stops on a conflicting active configuration instead of silently
+overwriting it.
 Do not set `application_enabled=false` to migrate a running installation; that
 would plan removal of its workloads.
 
@@ -723,8 +733,71 @@ would plan removal of its workloads.
 4. Update `backend_image_digest` and `web_image_digest` for OpsRabbit releases;
    update the OpenSandbox image digests only when a reviewed adapter/runtime
    rebuild is intended.
-5. Review `terraform plan`.
-6. Apply and repeat the health and persistence checks.
+5. Complete the pre-apply reconciliation below while the administrator UI/API
+   is still available. Confirm the backend image advertises the required
+   `resourceLimits` and `lifecycleLimits` capabilities.
+6. Review `terraform plan`, apply, and repeat bootstrap, health and persistence
+   checks. A successful health request alone does not qualify chat/file execution.
+
+### Reconcile existing sandbox settings before replacement
+
+Schedule a maintenance window and stop new sandbox work. While the current
+backend and controller are still reachable, use Configuration > Sandbox as an
+administrator, or its authenticated backend API
+`GET/PATCH /configuration/system/sandbox`. Save the intended runtime image and
+one-hour idle/one-day maximum-age policy before replacing ACI or rolling out ACA.
+The API's partial PATCH for a lifecycle-only correction is:
+
+```json
+{"sandbox_prune_idle_hours":1,"sandbox_prune_max_age_days":1}
+```
+
+For a runtime-image change, include `sandbox_docker_image` with the exact new
+runtime registry/repository/digest from the reviewed installer inputs. Omit the
+API-key field entirely and keep the controller endpoint unchanged: the product
+preserves the existing encrypted key in this case. Preserve OpenSandbox provider,
+enabled/all mode, session scope, workspace-only isolation, denied network egress,
+and the pool's 0.5 CPU/1g memory policy. Do not resume sandbox work between saving
+the new image and completing the corresponding controller/pool update.
+
+The product's configuration route fences active operations and retires managed
+sandboxes; temporary workspace files can be lost. Resolve retirement failures
+before proceeding, then GET the settings again to confirm the saved image and
+lifecycle values. A PATCH may have saved settings before later cleanup failed,
+so do not infer rollback from an error response. Saving configuration does not
+verify the new runtime: the subsequent installer bootstrap must still pass.
+
+Changing the controller endpoint is a separate credential migration: the product
+rejects retaining an endpoint-bound saved key implicitly. This key-preserving
+procedure does not change endpoints or rotate credentials.
+
+### Recover when bootstrap blocks application startup
+
+Do not keep retrying an unchanged plan after an administrator-reconciliation
+error. `--install`, `--verify`, and the plain initializer cannot update an
+existing configuration row. Reset deletes both settings and the stored key;
+it is not an upgrade or recovery step.
+
+If an older ACA revision remains healthy and reachable, use its authenticated
+administrator UI/API to reconcile as above, confirm the saved values, then
+generate a fresh reviewed plan for the intended deployment.
+
+If ACI has already been replaced (or no ACA revision is usable), first restore
+administrator access through a reviewed rollback to the last compatible
+installer/bootstrap source and backend/runtime inputs. Before applying that
+rollback, verify that its bootstrap accepts the settings currently saved and
+that its backend supports the current database migration history. Reverting
+only the backend digest is insufficient if the new bootstrap capability gate or
+runtime inputs still conflict. Keep the database, storage, endpoint, Terraform
+state, generated credentials and application encryption/auth secrets intact.
+Once the compatible backend is available, reconcile through its administrator
+UI/API and prepare a fresh plan for the upgrade.
+
+If migration compatibility or a runnable compatible backend cannot be established,
+stop and obtain a product-supported recovery plan; there is no supported offline
+reconciliation CLI in this contract. Do not edit database rows, bypass configuration
+locks, reset settings/secrets, remove bootstrap verification, or set
+`application_enabled=false` to force recovery. The latter plans workload removal.
 
 Do not change the PostgreSQL database, storage account, shares, Better Auth
 secret, or OpsRabbit encryption key during a routine image upgrade.

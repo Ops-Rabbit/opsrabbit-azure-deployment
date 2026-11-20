@@ -49,10 +49,12 @@ that dedicated registry. No controller key or
 Azure access token is forwarded into the execution container or returned in
 endpoint metadata.
 
-The proof's HTTPS controller ingress requires its API key and is restricted to
-the walkthrough client's public IP. The Azure pool gateway requires Entra
-authentication. The pool has `EgressDisabled`. This is not proof of a private-only
-customer network topology.
+The original standalone proof restricted HTTPS controller ingress to the
+walkthrough client's public IP. The customer Terraform public mode has no IP
+allowlist: its HTTPS controller ingress is public and requires the API key.
+Private mode uses the internal ACA environment. The Azure pool gateway requires
+Entra authentication, and the pool has `EgressDisabled`. The historical public
+proof does not qualify the private customer network topology.
 
 Bubblewrap starts **execd itself** in a restricted view. `/workspace` and a private
 `/tmp` are writable; `/usr` and the execd binary are read-only. Host `/etc` and
@@ -204,6 +206,9 @@ cleanup check fails.
 - A centrally managed release image pipeline remains necessary; the current
   helper builds, scans and publishes to the customer's ACR.
 
-Keep this test setup running for the requested walkthrough. Individual sessions
-remain ephemeral. Warm capacity, Container Apps and retained registry storage can
-incur charges. Teardown requires a subsequent user instruction.
+The walkthrough retention instruction was superseded by the user's teardown
+request on 12 November 2026. The recorded teardown completed that day; only two
+image registries and separate Terraform-state storage were retained. See the
+[historical deployment and teardown report](../../docs/qa-runs/2026-11-12-SKILLS-156-native-azure-chat.md).
+The resumed work is local fixes/tests/reviews only; no new deployment or merge
+is authorized. No fresh live inventory check is claimed.

@@ -112,6 +112,8 @@ resource "random_id" "container_app_revision" {
       var.opensandbox_server_image_digest,
       local.opensandbox_runtime_image,
       var.opensandbox_max_sessions,
+      local.opensandbox_lifecycle_limits,
+      local.opensandbox_pool_id,
     ])) : "disabled"
   }
 }

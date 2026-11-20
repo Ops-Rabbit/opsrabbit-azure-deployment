@@ -1,5 +1,16 @@
 # SKILLS-156 Azure image remediation — 12 November 2026
 
+> Historical remediation results for `67211bf` and its image configuration
+> IDs, not the current dirty candidate. The later runtime `4268457` and
+> controller `fab51a3` passed image scans, CI, 32 live API checks (including
+> disconnect cancellation) and 9 restart checks. Actual Chrome chat failed on
+> the lifecycle mismatch; generated chat-file download did not pass. See the
+> [native report](2026-11-12-SKILLS-156-native-azure-chat.md) for published digests
+> and the completed 12 November teardown. Local fixes/tests/reviews have resumed,
+> with no deployment or merge authorized and no fresh live inventory check.
+> Historical CI/images do not qualify the new candidate; the backend security
+> exception covers only its exact historical digest for synthetic-data QA.
+
 ## Result
 
 Both rebuilt images have zero High and zero Critical findings, with no
@@ -68,8 +79,16 @@ High/Critical severity. No finding was waived or hidden with ignore-unfixed.
 
 ## Remaining qualification
 
-No Azure resources were provisioned, and these images were not published to an
-ACR or deployed. Live customer-installer, chat and restart/revision checks must
+During this remediation validation, no Azure resources were provisioned and
+these images were not published to an ACR or deployed. Live customer-installer,
+chat and restart/revision checks must
 be repeated with the final published digests. Alpine uses musl: arbitrary
 glibc-only executables and browser automation remain unqualified. GitHub's
 required approval and the connector review are separate from these test results.
+
+The current runtime image-pull boundary is a dedicated runtime-only ACR;
+application and unrelated images must not be stored there. Controller disconnect
+cleanup targets the exact execution and checks allocation identity. An unobserved
+completion can still produce a redundant DELETE. Upstream rejects an already
+finished command, but its running/PID snapshot-to-signal operation is not atomic;
+this controller patch does not remove that upstream limitation.

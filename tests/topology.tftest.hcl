@@ -172,6 +172,17 @@ run "complete_application_topology" {
   command = plan
 
   override_resource {
+    target          = random_password.opensandbox_api_key[0]
+    override_during = plan
+    values          = { result = "synthetic-lifecycle-test-only" }
+  }
+  override_resource {
+    target          = azurerm_container_app_environment.opsrabbit[0]
+    override_during = plan
+    values          = { default_domain = "test.eastus2.azurecontainerapps.io" }
+  }
+
+  override_resource {
     target          = azurerm_container_group.opsrabbit[0]
     override_during = plan
     values = {
@@ -204,7 +215,7 @@ run "complete_application_topology" {
   }
 
   assert {
-    condition     = strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "--capabilities") && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "c.resourceLimits===true")
+    condition     = strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "--capabilities") && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "c.resourceLimits===true") && strcontains(azurerm_container_group.opsrabbit[0].init_container[0].commands[2], "c.lifecycleLimits===true")
     error_message = "ACI bootstrap must reject backend images without the verified-install contract."
   }
 
@@ -217,8 +228,8 @@ run "complete_application_topology" {
   }
 
   assert {
-    condition     = azurerm_container_group.opsrabbit[0].init_container[0].environment_variables["OPENSANDBOX_BOOTSTRAP_REVISION"] == local.opensandbox_bootstrap_revision
-    error_message = "ACI must rerun verify-before-enable bootstrap when OpenSandbox server/runtime digests or session capacity change."
+    condition     = azurerm_container_group.opsrabbit[0].init_container[0].environment_variables["OPENSANDBOX_BOOTSTRAP_REVISION"] == local.opensandbox_bootstrap_revision && jsondecode(local.opensandbox_bootstrap_json).lifecycleLimits.idleHours == 1 && jsondecode(local.opensandbox_bootstrap_json).lifecycleLimits.maxAgeDays == 1
+    error_message = "ACI must carry the bootstrap fingerprint and the explicit one-hour/one-day lifecycle policy into installation."
   }
 
   assert {
@@ -279,6 +290,32 @@ run "complete_application_topology" {
   assert {
     condition     = output.opsrabbit_url == "http://opsrabbit-test.eastus2.azurecontainer.io:8080"
     error_message = "The public OpsRabbit output must match the ACI DNS label and port."
+  }
+}
+
+# Only the pool name differs from complete_application_topology. Assert the
+# actual init-container environment against independent fixture values, not
+# merely equality with the production fingerprint local.
+run "pool_replacement_changes_aci_bootstrap_revision" {
+  command = plan
+
+  variables {
+    container_group_enabled = true
+    opensandbox_pool_name   = "replacementsessions"
+  }
+
+  assert {
+    condition = (
+      azapi_resource.opensandbox_pool_image_pull[0].name == "replacementsessions" &&
+      azurerm_container_group.opsrabbit[0].init_container[0].environment_variables["OPENSANDBOX_BOOTSTRAP_REVISION"] == sha256(jsonencode({
+        server_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        runtime_image = "opsrabbittestruntime.azurecr.io/opsrabbit/opensandbox-runtime@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        max_sessions  = 2
+        lifecycle     = { idleHours = 1, maxAgeDays = 1 }
+        pool_id       = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/sessionPools/replacementsessions"
+      }))
+    )
+    error_message = "A pool-only replacement must change the ACI init-container fingerprint while images, capacity and lifecycle remain unchanged."
   }
 }
 

@@ -47,6 +47,8 @@ COMMAND_RECORD_LIMIT = 64 * 1024
 COMMAND_CANCEL_SECONDS = 2.0
 COMMAND_INIT_DRAIN_SECONDS = 2.0
 COMMAND_INIT_DRAIN_BYTES = 128 * 1024
+STREAM_REFRESH_WAIT = 0.5
+STREAM_CONFIRMATION_TTL = 1.0
 LOG = logging.getLogger(__name__)
 ALLOWED_PATHS = {
     "/ping",
@@ -207,6 +209,27 @@ def interrupt_stream(response):
                 pass
 
 
+class StreamLease:
+    """Last-confirmed authority; guarded only by the stream condition, never DB I/O."""
+
+    def __init__(self, sid, row):
+        self.sid = sid
+        self.original = row
+        self.image = json.loads(row[0]).get("image", {}).get("uri")
+        self.absolute_deadline = (
+            datetime.fromisoformat(
+                json.loads(row[0])["createdAt"].replace("Z", "+00:00")
+            ).timestamp()
+            + MAX_LEASE
+        )
+        self.deadline = min(row[1], self.absolute_deadline)
+        self.monotonic_deadline = time.monotonic() + max(0, self.deadline - time.time())
+        self.confirmed_until = time.monotonic() + STREAM_CONFIRMATION_TTL
+        self.revision = 0
+        self.finished = threading.Event()
+        self.invalidated = threading.Event()
+
+
 class AzureSandboxService(SandboxService, ExtensionService):
     def __init__(self, config, *, credential=None, client=None, start_threads=True):
         if config.tenants is not None:
@@ -254,6 +277,10 @@ class AzureSandboxService(SandboxService, ExtensionService):
         )
         self.lock = threading.RLock()
         self.session_locks = {}
+        self.stream_condition = threading.Condition()
+        self.stream_leases = set()
+        self.stream_refresh_wake = threading.Event()
+        self.stream_refresh_thread = None
         self.postgres = bool(os.environ.get("AZURE_SESSION_DATABASE_URL"))
         if self.postgres:
             import psycopg
@@ -627,7 +654,7 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 "Image must match the approved session pool digest; registry credentials are not accepted",
             )
         if request.timeout is None or not 60 <= request.timeout <= MAX_LEASE:
-            fail(400, "An explicit lifetime of 60 seconds to 7 days is required")
+            fail(400, "An explicit lifetime of 60 to 3600 seconds is required")
         values = request.model_dump(exclude_none=True)
         allowed = {
             "image",
@@ -1039,6 +1066,129 @@ class AzureSandboxService(SandboxService, ExtensionService):
         finally:
             state.finished.set()
 
+    def _register_stream_lease(self, sid, row):
+        lease = StreamLease(sid, row)
+        with self.stream_condition:
+            self.stream_leases.add(lease)
+            if self.stream_refresh_thread is None:
+                # One worker for the controller, never a new thread/future for
+                # each refresh. A stuck driver cannot accumulate blocked workers.
+                self.stream_refresh_thread = threading.Thread(
+                    target=self._refresh_stream_leases,
+                    daemon=True,
+                    name="azure-stream-lease-refresh",
+                )
+                self.stream_refresh_thread.start()
+        self.stream_refresh_wake.set()
+        return lease
+
+    def _confirmed_stream_remaining(self, lease):
+        # Caller holds only stream_condition. No session lock, DB lock or I/O.
+        remaining = min(
+            lease.deadline - time.time(),
+            lease.monotonic_deadline - time.monotonic(),
+            lease.confirmed_until - time.monotonic(),
+        )
+        if (
+            remaining <= 0
+            or lease.invalidated.is_set()
+            or lease.finished.is_set()
+            or not self.leader_ready
+            or self.shutdown.is_set()
+            or lease.image != self.image
+        ):
+            lease.invalidated.set()
+            return 0
+        return remaining
+
+    def _confirm_stream_row(self, lease, row):
+        # Never revive a stream whose confirmed deadline/freshness has elapsed,
+        # even if a previously stalled query eventually returns a valid row.
+        if self._confirmed_stream_remaining(lease) <= 0:
+            return
+        if (
+            row is None
+            or not lease.original[3]
+            or row[3:8] != lease.original[3:8]
+            or row[7] != RUNTIME_CONTRACT
+            or json.loads(row[0]).get("image", {}).get("uri") != self.image
+        ):
+            lease.invalidated.set()
+            return
+        deadline = min(row[1], lease.absolute_deadline)
+        if deadline != lease.deadline:
+            lease.deadline = deadline
+            lease.monotonic_deadline = time.monotonic() + max(0, deadline - time.time())
+        lease.confirmed_until = time.monotonic() + STREAM_CONFIRMATION_TTL
+        lease.revision += 1
+
+    def _refresh_stream_leases(self):
+        try:
+            self._run_stream_refresh()
+        finally:
+            if self.shutdown.is_set():
+                # If a driver call outlives close(), this sole worker owns final
+                # connection disposal. Do not make close() wait on that query.
+                self.db.close()
+
+    def _run_stream_refresh(self):
+        while not self.shutdown.is_set():
+            self.stream_refresh_wake.wait(0.05)
+            self.stream_refresh_wake.clear()
+            with self.stream_condition:
+                groups = {}
+                for lease in self.stream_leases:
+                    if self._confirmed_stream_remaining(lease) > 0:
+                        groups.setdefault(lease.sid, []).append(lease)
+            if not groups or not self.lock.acquire(timeout=0.05):
+                continue
+            try:
+                for sid, leases in groups.items():
+                    if self.shutdown.is_set():
+                        break
+                    started = time.monotonic()
+                    try:
+                        self._require_leader()
+                        row = self._row(sid)
+                    except Exception:
+                        row = None  # Database uncertainty fences, never logs secrets.
+                    if time.monotonic() - started > STREAM_REFRESH_WAIT:
+                        row = None
+                    with self.stream_condition:
+                        for lease in leases:
+                            if lease in self.stream_leases:
+                                self._confirm_stream_row(lease, row)
+                        self.stream_condition.notify_all()
+            finally:
+                self.lock.release()
+
+    def _stream_remaining(self, lease):
+        # Output needs a fresh journal validation, not merely a cached expiry.
+        # Wait only on the separate condition: a stuck query/DB lock cannot
+        # strand the output thread or the socket-expiry watchdog.
+        with self.stream_condition:
+            remaining = self._confirmed_stream_remaining(lease)
+            if remaining <= 0:
+                return 0
+            revision = lease.revision
+            self.stream_refresh_wake.set()
+            refreshed = self.stream_condition.wait_for(
+                lambda: lease.revision != revision or lease.invalidated.is_set(),
+                timeout=min(STREAM_REFRESH_WAIT, remaining),
+            )
+            if not refreshed:
+                lease.invalidated.set()
+            return self._confirmed_stream_remaining(lease)
+
+    def _watch_stream_lease(self, response, lease):
+        while not lease.finished.is_set():
+            with self.stream_condition:
+                remaining = self._confirmed_stream_remaining(lease)
+            if remaining <= 0:
+                interrupt_stream(response)
+                return
+            lease.finished.wait(min(0.05, remaining))
+
     def forward(self, handler):
         url = urlsplit(handler.path)
         parts = url.path.split("/", 2)
@@ -1093,10 +1243,9 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 token = row[4]
             headers = self._headers()
             headers["X-EXECD-ACCESS-TOKEN"] = token
-            if foreground:
-                # Watchdogs own this socket through teardown: it must never
-                # return to the pool for another sandbox/request in that race.
-                headers["Connection"] = "close"
+            # Lease and cancellation watchdogs own this HTTP/1 socket through
+            # teardown; it must not return to the pool for another request.
+            headers["Connection"] = "close"
             if handler.headers.get("Range"):
                 byte_range = handler.headers["Range"]
                 if not re.fullmatch(r"bytes=\d+-\d*", byte_range):
@@ -1105,22 +1254,37 @@ class AzureSandboxService(SandboxService, ExtensionService):
             if handler.headers.get("Content-Type"):
                 headers["Content-Type"] = handler.headers["Content-Type"]
             params = pairs + [("identifier", sid), ("api-version", API_VERSION)]
+            timeouts = stream_timeout(remaining).as_dict()
             stream = self.client.stream(
                 handler.command,
                 self.pool + path,
                 params=params,
                 headers=headers,
                 content=body,
-                timeout=stream_timeout(remaining),
+                extensions={"timeout": timeouts},
             )
             # Serialize only this sandbox until Azure acknowledges the request;
             # unrelated sessions remain available during cold allocation calls.
             response = stream.__enter__()
+            # HTTPX passes the timeout extension to HTTP/1 body reads after
+            # headers. Keep admission/header timeouts unchanged, but do not pin
+            # a quiet body to the lease that preceded a valid renewal. The
+            # watchdog enforces the mutable deadline and the absolute cap.
+            timeouts["read"] = MAX_LEASE
+            lease = self._register_stream_lease(sid, row)
         state = (
             ForegroundCommand() if foreground and response.status_code == 200 else None
         )
         watcher = None
+        lease_finished = lease.finished
+        lease_invalidated = lease.invalidated
+        lease_watcher = threading.Thread(
+            target=self._watch_stream_lease,
+            args=(response, lease),
+            daemon=True,
+        )
         try:
+            lease_watcher.start()
             if state is not None:
                 watcher = threading.Thread(
                     target=self._watch_foreground,
@@ -1144,7 +1308,11 @@ class AzureSandboxService(SandboxService, ExtensionService):
             if not streaming:
                 for chunk in response.iter_bytes():
                     payload.extend(chunk)
-                    if len(payload) > MAX_BODY or time.time() >= row[1]:
+                    if (
+                        len(payload) > MAX_BODY
+                        or lease_invalidated.is_set()
+                        or self._stream_remaining(lease) <= 0
+                    ):
                         fail(413, "Response exceeds the transfer or lifetime limit")
                 expected_length = response.headers.get("Content-Length")
                 if (
@@ -1155,6 +1323,8 @@ class AzureSandboxService(SandboxService, ExtensionService):
                     and len(payload) != int(expected_length)
                 ):
                     fail(502, "Sandbox returned an incomplete transfer")
+            if lease_invalidated.is_set() or self._stream_remaining(lease) <= 0:
+                fail(413, "Response exceeds the lifetime limit")
             try:
                 handler.send_response(response.status_code)
                 handler.send_header(
@@ -1189,7 +1359,11 @@ class AzureSandboxService(SandboxService, ExtensionService):
                                 return
                             continue
                     size += len(chunk)
-                    if size > MAX_BODY or time.time() >= row[1]:
+                    if (
+                        size > MAX_BODY
+                        or lease_invalidated.is_set()
+                        or self._stream_remaining(lease) <= 0
+                    ):
                         # No execution_complete event is emitted on interruption.
                         handler.close_connection = True
                         return
@@ -1208,6 +1382,11 @@ class AzureSandboxService(SandboxService, ExtensionService):
                 state.abandon()
             raise
         finally:
+            lease_finished.set()
+            with self.stream_condition:
+                self.stream_leases.discard(lease)
+                self.stream_condition.notify_all()
+            lease_watcher.join(timeout=1)
             if state is not None:
                 # Also parse a complete unterminated record on interruption.
                 state.end_of_stream()
@@ -1256,11 +1435,26 @@ class AzureSandboxService(SandboxService, ExtensionService):
             data["expiresAt"] = request.expires_at.isoformat()
             with self.lock:
                 self._require_leader()
-                self._execute(
-                    "UPDATE sessions SET deadline=?,data=? WHERE id=?",
-                    (deadline, json.dumps(data), sandbox_id),
-                )
-                self.db.commit()
+                try:
+                    self._execute(
+                        "UPDATE sessions SET deadline=?,data=? WHERE id=?",
+                        (deadline, json.dumps(data), sandbox_id),
+                    )
+                    self.db.commit()
+                except Exception:
+                    # The shared connection must not expose an uncommitted
+                    # renewal to the refresher after persistence fails.
+                    self.db.rollback()
+                    raise
+                # Publish only committed renewal, before releasing the DB lock.
+                # This avoids expiry at the old deadline while the refresher is
+                # waiting its turn, and never revives an already-fenced stream.
+                current = (json.dumps(data), deadline, *row[2:])
+                with self.stream_condition:
+                    for lease in self.stream_leases:
+                        if lease.sid == sandbox_id:
+                            self._confirm_stream_row(lease, current)
+                    self.stream_condition.notify_all()
             return RenewSandboxExpirationResponse(expiresAt=request.expires_at)
 
     pause_sandbox = resume_sandbox = patch_sandbox_metadata = _unsupported
@@ -1269,6 +1463,14 @@ class AzureSandboxService(SandboxService, ExtensionService):
 
     def close(self):
         self.shutdown.set()
+        with self.stream_condition:
+            for lease in self.stream_leases:
+                lease.invalidated.set()
+            self.stream_leases.clear()
+            self.stream_condition.notify_all()
+        self.stream_refresh_wake.set()
+        if self.stream_refresh_thread is not None:
+            self.stream_refresh_thread.join(timeout=1)
         if hasattr(self, "bridge"):
             self.bridge.shutdown()
         if self.leadership_thread is not None:
@@ -1277,7 +1479,11 @@ class AzureSandboxService(SandboxService, ExtensionService):
         if self.cancel_client is not None:
             self.cancel_client.close()
         self.credential.close()
-        self.db.close()
+        if (
+            self.stream_refresh_thread is None
+            or not self.stream_refresh_thread.is_alive()
+        ):
+            self.db.close()
 
 
 class AzureSnapshotsUnsupported:

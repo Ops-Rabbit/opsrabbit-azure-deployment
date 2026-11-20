@@ -1,5 +1,8 @@
 # SKILLS-156: mandatory OpenSandbox on Azure Dynamic Sessions
 
+The original feasibility plan and observations below are retained as history.
+See the qualification and resumed-work notes at the end; historical results do not qualify the current working tree.
+
 ## Scope
 
 Prove the real OpenSandbox server/API can use custom-container Dynamic Sessions. No AKS, VM, native Azure-only product replacement or weakened workspace-only isolation. Installer integration follows only after proof. New installations require sandbox verification; existing administrator settings must not be silently overwritten.
@@ -40,11 +43,11 @@ Local adapter/protocol tests, lint/security review, and live Azure observations 
 
 Microsoft reference sample reviewed at a76d4eb3dab30f9d02dcff6aa4063ba87343d9d5. Its shared identity/resource-access pattern is not copied: the probe identity is image-pull-only and unavailable during session execution. No Azure OpenAI/model resources are needed for this proof.
 
-## Walkthrough retention
+## Historical walkthrough retention — 3 November 2026
 
 The user explicitly requested on 2026-11-03 that the setup remain running after testing. Do not delete the environment, registry, identity or session pool. Individual sessions are ephemeral under the configured 300-second idle cooldown and can be recreated for the walkthrough. Retained infrastructure and one warm session can incur charges.
 
-## Completed feasibility proof
+## Historical completed feasibility proof — 3 November 2026
 
 The real OpenSandbox service on Container Apps now allocates custom-container
 Dynamic Sessions and proxies actual execd commands and files. All 33 live
@@ -55,3 +58,35 @@ The setup remains running for the walkthrough. Customer installer/bootstrap
 integration, durable controller recovery, full product-image validation and
 remaining High image findings are still open. PR #20 is a draft feasibility
 review; it has not been merged or approved as a production release.
+
+## Historical qualification and teardown — 12 November 2026
+
+Runtime `4268457`, controller `fab51a3`, and product `00bcb7c0a` identify the
+last deployed/tested sources, not the current uncommitted candidate. Their CI
+and sandbox image scans passed. All 32 live API checks, including disconnected
+parent/child cancellation, and all 9 controller-restart checks passed. Actual
+Chrome chat failed on the lifetime mismatch; generated chat-file download did
+not pass. See the [native Azure and chat report](../qa-runs/2026-11-12-SKILLS-156-native-azure-chat.md).
+
+The teardown record confirms completion at 2026-11-12T17:15:43.394312+00:00.
+Only two image registries remained in the application resource group, with
+separate Terraform-state storage retained. Database/files/configuration backups
+remain private; full restoration has not been rehearsed. This supersedes the
+earlier walkthrough-retention instructions and is not a fresh inventory check.
+
+## Resumed local fixes — 20 November 2026
+
+Authorization covers local fixes/tests/reviews only; no Azure deployment or merge.
+The coordinating task schedules verification. Historical images, CI and reviews
+do not qualify the dirty lifecycle or pool-fingerprint changes. The prior backend
+security exception applies only to its exact digest for synthetic-data QA.
+
+Both application fingerprints now include the plan-known session-pool ARM
+identity. Pool-only replacement regressions assert the ACI init environment and
+ACA revision keeper against independent fixture values. This changes bootstrap
+rerun behavior, not resource authorization, credential handling or data retention;
+no new durable store is introduced. Upgrade docs require reconciliation through
+the authenticated admin API before replacement and describe a compatibility-
+checked rollback when startup is blocked, without resetting settings or secrets.
+The new regression cases have not been run in this editing pass. Main owns tests,
+format/validation checks and review of the final candidate.

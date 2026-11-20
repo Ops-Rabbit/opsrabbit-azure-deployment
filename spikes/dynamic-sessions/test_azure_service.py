@@ -4,6 +4,7 @@ import os
 import concurrent.futures
 import threading
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone, timedelta
 import hashlib
 import io
@@ -829,6 +830,447 @@ class AdapterTests(unittest.TestCase):
             ),
         )
 
+    def lease_stream_case(self, *, command, action, quiet=False, expire=True):
+        clock = [float(int(time.time()))]
+        module = "opensandbox_server.services.azure_service."
+        with patch(module + "time.time", side_effect=lambda: clock[0]):
+            sid = self.service._create(self.request()).id
+            started = threading.Event()
+            resume = threading.Event()
+            interrupted = threading.Event()
+            errors = []
+            renew_errors = []
+            renewed = threading.Event()
+            blocker_started = threading.Event()
+            release_blocker = threading.Event()
+            blocker = None
+            row_patch = None
+            statuses = []
+            timeouts = []
+            connections = []
+            execution_id = "e" * 32
+            first = (
+                json.dumps({"type": "init", "text": execution_id}).encode() + b"\n"
+                if command
+                else b"first-"
+            )
+            last = b'{"type":"execution_complete"}\n' if command else b"last"
+            owner = self
+
+            class LeaseStream(httpx.SyncByteStream):
+                def __iter__(self):
+                    yield first
+                    started.set()
+                    owner.assertTrue(resume.wait(3), "renewal blocked by stream lock")
+                    if quiet:
+                        owner.assertTrue(
+                            interrupted.wait(3), "quiet expired/rebound stream survived"
+                        )
+                        return
+                    yield last
+
+            original = self.transport
+            target = "/command" if command else "/files/download"
+
+            def transport(request):
+                if request.url.path == target and request.method != "DELETE":
+                    connections.append(request.headers.get("Connection"))
+                    # Preserve a snapshot of header-phase timeouts and the live
+                    # extension used by HTTPX when body iteration begins.
+                    timeouts.append(dict(request.extensions["timeout"]))
+                    timeouts.append(request.extensions["timeout"])
+                    return httpx.Response(
+                        200,
+                        stream=LeaseStream(),
+                        extensions={
+                            "network_stream": SimpleNamespace(
+                                get_extra_info=lambda _: SimpleNamespace(
+                                    shutdown=lambda _: interrupted.set()
+                                )
+                            )
+                        },
+                    )
+                return original(request)
+
+            self.service.client.close()
+            self.service.client = httpx.Client(transport=httpx.MockTransport(transport))
+            downstream, peer = socket.socketpair()
+            body = b'{"command":"sleep 30","background":false}' if command else b""
+            handler = SimpleNamespace(
+                path=f"/{sid}{target}",
+                command="POST" if command else "GET",
+                headers={"Content-Length": str(len(body))},
+                rfile=io.BytesIO(body),
+                wfile=io.BytesIO(),
+                connection=downstream,
+                send_response=statuses.append,
+                send_header=lambda *_: None,
+                end_headers=lambda: None,
+            )
+
+            def forward():
+                try:
+                    self.service.forward(handler)
+                except BaseException as error:
+                    errors.append(error)
+
+            def renew():
+                try:
+                    self.service.renew_expiration(
+                        sid,
+                        SimpleNamespace(
+                            expires_at=datetime.fromtimestamp(
+                                clock[0] + (600 if action == "extend" else 60),
+                                timezone.utc,
+                            )
+                        ),
+                    )
+                except BaseException as error:
+                    renew_errors.append(error)
+                finally:
+                    renewed.set()
+
+            worker = threading.Thread(target=forward, daemon=True)
+            renewer = threading.Thread(target=renew, daemon=True)
+            try:
+                worker.start()
+                self.assertTrue(started.wait(2))
+                if action in ("extend", "shorten"):
+                    renewer.start()
+                    self.assertTrue(
+                        renewed.wait(2), "renewal held behind response body"
+                    )
+                    self.assertEqual(renew_errors, [])
+                    clock[0] += 121 if action == "extend" else 60
+                elif action in ("lock_stall", "query_stall"):
+                    refresh_thread = self.service.stream_refresh_thread
+                    original_row = self.service._row
+
+                    def stall():
+                        blocker_started.set()
+                        owner.assertTrue(release_blocker.wait(5))
+
+                    if action == "lock_stall":
+
+                        def hold_lock():
+                            with self.service.lock:
+                                stall()
+
+                        blocker = threading.Thread(target=hold_lock, daemon=True)
+                        blocker.start()
+                    else:
+
+                        def blocked_row(sandbox_id):
+                            if threading.current_thread() is refresh_thread:
+                                stall()
+                            return original_row(sandbox_id)
+
+                        row_patch = patch.object(
+                            self.service, "_row", side_effect=blocked_row
+                        )
+                        row_patch.start()
+                    self.assertTrue(blocker_started.wait(2))
+                    if expire:
+                        clock[0] += 120  # Confirmed expiry while DB stays blocked.
+                else:
+                    with self.service.lock:
+                        if action == "leadership":
+                            self.service.leader_ready = False
+                        elif action == "missing":
+                            self.service._tombstone(sid)
+                        elif action == "retiring":
+                            self.service._execute(
+                                "UPDATE sessions SET state='retiring' WHERE id=?",
+                                (sid,),
+                            )
+                        elif action == "generation":
+                            self.service._execute(
+                                "UPDATE sessions SET etag='replacement' WHERE id=?",
+                                (sid,),
+                            )
+                        elif action == "credential":
+                            self.service._execute(
+                                "UPDATE sessions SET token='replacement' WHERE id=?",
+                                (sid,),
+                            )
+                        self.service.db.commit()
+                resume.set()
+                if action in ("lock_stall", "query_stall"):
+                    if quiet:
+                        self.assertTrue(
+                            interrupted.wait(2), "expiry waited for the DB lock/query"
+                        )
+                    self.assertFalse(release_blocker.is_set())
+                    if not command:
+                        worker.join(2)
+                        self.assertFalse(worker.is_alive(), "output waited on DB I/O")
+                        self.assertEqual(self.service.stream_leases, set())
+                    self.assertIs(self.service.stream_refresh_thread, refresh_thread)
+                    self.assertEqual(
+                        sum(
+                            t.name == "azure-stream-lease-refresh"
+                            for t in threading.enumerate()
+                        ),
+                        1,
+                    )
+                    release_blocker.set()
+                worker.join(4)
+                self.assertFalse(worker.is_alive())
+                if action == "extend":
+                    self.assertEqual(errors, [])
+                    self.assertEqual(statuses, [200])
+                    self.assertEqual(handler.wfile.getvalue(), first + last)
+                    self.assertFalse(interrupted.is_set())
+                else:
+                    self.assertEqual(
+                        handler.wfile.getvalue(), first if command else b""
+                    )
+                    self.assertEqual(statuses, [200] if command else [])
+                    if command:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertEqual(len(errors), 1)
+                        self.assertIsInstance(errors[0], HTTPException)
+                    if quiet:
+                        self.assertTrue(interrupted.is_set())
+                self.assertEqual(connections, ["close"])
+                self.assertEqual(timeouts[0]["read"], 120)
+                self.assertEqual(timeouts[0]["connect"], 45)
+                self.assertEqual(timeouts[1]["read"], 3600)
+                self.assertNotIn("/.management/stopSession", self.calls)
+                self.assertNotIn("/command", self.calls)
+            finally:
+                release_blocker.set()
+                resume.set()
+                interrupted.set()
+                peer.close()
+                downstream.close()
+                worker.join(4)
+                if renewer.ident is not None:
+                    renewer.join(4)
+                if blocker is not None:
+                    blocker.join(2)
+                if row_patch is not None:
+                    row_patch.stop()
+                self.service.leader_ready = True
+                # Keep each subcase independent without stopping Azure fixtures.
+                with self.service.lock:
+                    self.service._tombstone(sid)
+                self.allocated.pop(sid, None)
+
+    def test_real_http_quiet_body_survives_renewal_past_original_read_timeout(self):
+        # Use the installed HTTPX/httpcore transport and a real loopback socket.
+        # MockTransport cannot prove that timeout changes reach socket reads.
+        clock = [float(int(time.time()))]
+        module = "opensandbox_server.services.azure_service."
+        reading = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        errors = []
+        payload = b"complete after a quiet renewed lease"
+        owner = self
+        with patch(module + "time.time", side_effect=lambda: clock[0]):
+            sid = self.service._create(self.request()).id
+            self.service.renew_expiration(
+                sid,
+                SimpleNamespace(
+                    expires_at=datetime.fromtimestamp(clock[0] + 1, timezone.utc)
+                ),
+            )
+
+            class Server(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    pass
+
+                def do_POST(self):
+                    data = json.dumps(owner.allocated[sid]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.flush()
+                    if release.wait(5):
+                        try:
+                            self.wfile.write(payload)
+                        except OSError:
+                            pass  # The failing pre-fix client has timed out.
+
+            def response_hook(response):
+                if response.request.method == "GET":
+
+                    def trace(event, _info):
+                        if event == "http11.receive_response_body.started":
+                            reading.set()
+
+                    response.request.extensions["trace"] = trace
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Server)
+            serving = threading.Thread(target=server.serve_forever, daemon=True)
+            self.service.client.close()
+            self.service.client = httpx.Client(
+                trust_env=False,
+                event_hooks={"response": [response_hook]},
+            )
+            self.service.pool = f"http://127.0.0.1:{server.server_port}"
+            statuses = []
+            handler = SimpleNamespace(
+                path=f"/{sid}/files/download?path=%2Fworkspace%2Fproof",
+                command="GET",
+                headers={},
+                rfile=io.BytesIO(),
+                wfile=io.BytesIO(),
+                send_response=statuses.append,
+                send_header=lambda *_: None,
+                end_headers=lambda: None,
+            )
+
+            def forward():
+                try:
+                    self.service.forward(handler)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=forward, daemon=True)
+            serving.start()
+            try:
+                worker.start()
+                self.assertTrue(reading.wait(2), "real HTTP body read never started")
+                self.service.renew_expiration(
+                    sid,
+                    SimpleNamespace(
+                        expires_at=datetime.fromtimestamp(clock[0] + 600, timezone.utc)
+                    ),
+                )
+                clock[0] += 2  # Past the old lease, inside the renewed lease.
+                self.assertFalse(
+                    done.wait(1.25),
+                    "quiet body ended at its original one-second read timeout",
+                )
+                release.set()
+                self.assertTrue(done.wait(3))
+                self.assertEqual(errors, [])
+                self.assertEqual(statuses, [200])
+                self.assertEqual(handler.wfile.getvalue(), payload)
+            finally:
+                release.set()
+                worker.join(4)
+                server.shutdown()
+                server.server_close()
+                serving.join(2)
+
+    def test_active_command_and_download_observe_extended_lease(self):
+        for command in (False, True):
+            with self.subTest(command=command):
+                self.lease_stream_case(command=command, action="extend")
+
+    def test_active_command_and_download_stop_at_shortened_deadline(self):
+        for command in (False, True):
+            with self.subTest(command=command):
+                self.lease_stream_case(command=command, action="shorten")
+
+    def test_quiet_command_and_download_observe_shortened_lease_and_fencing(self):
+        for action in (
+            "shorten",
+            "leadership",
+            "missing",
+            "retiring",
+            "generation",
+            "credential",
+        ):
+            for command in (False, True):
+                with self.subTest(command=command, action=action):
+                    self.lease_stream_case(command=command, action=action, quiet=True)
+
+    def test_stream_expiry_is_independent_of_a_held_lock_or_blocked_query(self):
+        for action in ("lock_stall", "query_stall"):
+            for command in (False, True):
+                with self.subTest(command=command, action=action):
+                    self.lease_stream_case(command=command, action=action, quiet=True)
+
+    def test_chunk_validation_does_not_wait_for_a_held_lock_or_blocked_query(self):
+        for action in ("lock_stall", "query_stall"):
+            with self.subTest(action=action):
+                self.lease_stream_case(
+                    command=False, action=action, quiet=False, expire=False
+                )
+
+    def test_quiet_stream_fails_closed_when_confirmation_becomes_stale(self):
+        self.lease_stream_case(
+            command=False, action="query_stall", quiet=True, expire=False
+        )
+
+    def test_close_does_not_wait_for_a_stalled_stream_refresh_query(self):
+        sid = self.service._create(self.request()).id
+        row = self.service._row(sid)
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        errors = []
+        original_row = self.service._row
+
+        def blocked_row(sandbox_id):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return original_row(sandbox_id)
+
+        def close():
+            try:
+                self.service.close()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                closed.set()
+
+        with (
+            patch.object(self.service, "db", wraps=self.service.db) as database,
+            patch.object(self.service, "_row", side_effect=blocked_row),
+        ):
+            lease = self.service._register_stream_lease(sid, row)
+            closer = threading.Thread(target=close, daemon=True)
+            try:
+                self.assertTrue(entered.wait(2))
+                closer.start()
+                self.assertTrue(closed.wait(2), "close waited on the refresh query")
+                self.assertEqual(errors, [])
+                self.assertTrue(lease.invalidated.is_set())
+                self.assertEqual(self.service.stream_leases, set())
+                self.assertTrue(self.service.stream_refresh_thread.is_alive())
+                database.close.assert_not_called()
+            finally:
+                release.set()
+                self.service.stream_refresh_thread.join(2)
+                if closer.ident is not None:
+                    closer.join(2)
+            self.assertFalse(self.service.stream_refresh_thread.is_alive())
+            database.close.assert_called_once()
+
+    def test_failed_renewal_cannot_publish_an_uncommitted_deadline(self):
+        sid = self.service._create(self.request()).id
+        row = self.service._row(sid)
+        lease = self.service._register_stream_lease(sid, row)
+        with patch.object(self.service, "db", wraps=self.service.db) as database:
+            database.commit.side_effect = RuntimeError("synthetic commit failure")
+            with self.assertRaisesRegex(RuntimeError, "synthetic commit failure"):
+                self.service.renew_expiration(
+                    sid,
+                    SimpleNamespace(
+                        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30)
+                    ),
+                )
+            database.rollback.assert_called_once()
+        self.assertEqual(self.service._row(sid)[1], row[1])
+        with self.service.stream_condition:
+            self.assertEqual(lease.deadline, row[1])
+            lease.finished.set()
+            self.service.stream_leases.discard(lease)
+
     def test_retirement_erases_stored_credentials_and_metadata(self):
         sid = self.service._create(self.request(metadata={"purpose": "synthetic"})).id
         self.service.delete_sandbox(sid)
@@ -1008,6 +1450,28 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(requests[-1].headers["Connection"], "close")
         self.assertEqual(requests[-1].content, b"")
         self.assertLessEqual(requests[-1].extensions["timeout"]["read"], 0.25)
+
+    def test_cancel_after_renewal_keeps_the_original_execution_and_binding(self):
+        sid, row, state, headers = self.cancel_fixture()
+        self.service.renew_expiration(
+            sid,
+            SimpleNamespace(
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=30)
+            ),
+        )
+        self.assertGreater(self.service._row(sid)[1], row[1])
+        with patch.object(
+            self.service,
+            "_cancel_request",
+            side_effect=[(200, {"createdAt": row[3]}), (200, None)],
+        ) as request:
+            self.service._cancel_foreground(sid, row, state, headers)
+            self.service._cancel_foreground(sid, row, state, headers)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(
+            request.call_args.args[:4], (sid, "/command", "DELETE", headers)
+        )
+        self.assertEqual(request.call_args.kwargs, {"execution_id": "a" * 32})
 
     def test_cancel_refuses_missing_expired_rebound_and_nonleader_sessions(self):
         for mutation in (

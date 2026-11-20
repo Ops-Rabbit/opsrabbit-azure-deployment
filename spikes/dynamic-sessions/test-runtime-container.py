@@ -479,6 +479,37 @@ def exercise_runtime(image, profile):
             token,
             command='set -eu; for d in .opsrabbit-system .opsrabbit-empty .opsrabbit-skills .opsrabbit-browser-runtime; do test ! -w /workspace/$d; ! touch /workspace/$d/injected 2>/dev/null; ! mv /workspace/$d /workspace/moved 2>/dev/null; done; for d in proc etc root home var data mnt media srv; do test ! -w /$d; done; printf stdin-ok > /workspace/.opsrabbit-runtime/stdin; test "$(cat /workspace/.opsrabbit-runtime/stdin)" = stdin-ok',
         )
+        # Regress the aggregate-envelope argv limit with individually valid
+        # arguments/environment entries. Final execve limits still apply.
+        large_env = {"PAD_A": "a" * 71680, "PAD_B": "b" * 71680}
+        large_shell = (
+            'test "${#PAD_A}" -eq 71680 && test "${#PAD_B}" -eq 71680 && '
+            "test ! -e /proc/self/environ && printf large-shell-ok"
+        )
+        if (
+            run_command(host, token, command=large_shell, envs=large_env)
+            != "large-shell-ok"
+        ):
+            raise RuntimeError("large shell envelope was rejected or changed")
+        native_fields = ["x" * 71680, "y" * 71680]
+        expected_hash = hashlib.sha256("".join(native_fields).encode()).hexdigest()
+        native_code = (
+            "import hashlib, os, sys; "
+            "assert not os.path.exists('/proc/self/environ'); "
+            "assert len(os.environ['PAD_A']) == len(os.environ['PAD_B']) == 71680; "
+            "print(hashlib.sha256(''.join(sys.argv[1:]).encode()).hexdigest(), end='')"
+        )
+        if (
+            run_command(
+                host,
+                token,
+                argv=["/usr/local/bin/python", "-c", native_code, *native_fields],
+                envs=large_env,
+            )
+            != expected_hash
+        ):
+            raise RuntimeError("large native envelope was rejected or changed")
+
         for name in (
             ".opsrabbit-system",
             ".opsrabbit-empty",
@@ -615,6 +646,7 @@ print('namespace-filter-ok')
             json.dumps(
                 {
                     "argv": adversarial_lifecycle_argv("background"),
+                    "envs": large_env,
                     "background": True,
                     "timeout": 10000,
                 }
@@ -671,6 +703,7 @@ print('namespace-filter-ok')
             json.dumps(
                 {
                     "argv": adversarial_lifecycle_argv("disconnect"),
+                    "envs": large_env,
                     "timeout": 10000,
                     "background": False,
                 }

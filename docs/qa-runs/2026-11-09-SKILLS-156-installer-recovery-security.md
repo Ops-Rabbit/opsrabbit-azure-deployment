@@ -1,5 +1,17 @@
 # SKILLS-156 installer, recovery, and image scan checks
 
+> Historical report: the observations below describe the 9 November candidate.
+> The [12 November remediation report](2026-11-12-SKILLS-156-image-remediation.md)
+> supersedes its 47-High baseline for the tested images. Checked-in CI and
+> publication now reject High and Critical findings, and runtime pull access
+> uses a dedicated runtime-only ACR. The later deployed runtime `4268457` and
+> controller `fab51a3` passed scans, CI, 32 live API checks (including disconnect)
+> and 9 restart checks. Actual chat failed; generated chat-file download did not
+> pass. These are historical results, not qualification of the dirty candidate.
+> The [native report](2026-11-12-SKILLS-156-native-azure-chat.md) records provenance
+> and completed teardown. Local fixes/tests/reviews have resumed; deployment and
+> merge remain unauthorized. No fresh live inventory check is claimed.
+
 Observed 2026-11-09 16:28 UTC. No Azure resources were recreated. The Azure
 environment remains torn down at the user's direction.
 

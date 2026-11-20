@@ -8,7 +8,7 @@
  )
  
  const goosWindows = "windows"
-@@ -37,34 +36,41 @@
+@@ -37,34 +36,59 @@
  	return string(data)
  }
  
@@ -68,13 +68,82 @@
 +  Envs map[string]string `json:"envs"`
 + }{request.Code, request.Argv, request.Cwd, envs})
 + if err != nil { return nil, err }
-+ cmd := exec.CommandContext(ctx, "/usr/local/bin/python", "-I", "-S", "/opt/workspace-command.py", string(payload))
++ // Use an unlinked file in the supervisor's private tmpfs, not argv or stdin.
++ // No pipe writer can block on a failed/cancelled Start; no pathname survives.
++ // Command payloads and the file worker cannot access this private /tmp mount.
++ envelope, err := os.CreateTemp("/tmp", ".opsrabbit-command-")
++ if err != nil { return nil, err }
++ if err := os.Remove(envelope.Name()); err != nil {
++  envelope.Close()
++  return nil, err
++ }
++ if _, err := envelope.Write(payload); err != nil {
++  envelope.Close()
++  return nil, err
++ }
++ if _, err := envelope.Seek(0, 0); err != nil {
++  envelope.Close()
++  return nil, err
++ }
++ cmd := exec.CommandContext(ctx, "/usr/local/bin/python", "-I", "-S", "/opt/workspace-command.py", "--request-fd", "3")
++ cmd.ExtraFiles = []*os.File{envelope}
 + cmd.Dir = "/"
 + cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "LD_LIBRARY_PATH=/usr/local/lib", "HOME=/workspace"}
 + return cmd, nil
  }
  
  // nativeCommand preserves lookup failures as command start errors.
+--- a/components/execd/pkg/runtime/command.go
++++ b/components/execd/pkg/runtime/command.go
+@@ -237,6 +237,7 @@
+ 	if err != nil {
+ 		return fmt.Errorf("resolve request cwd %s: %w", request.Cwd, err)
+ 	}
++	defer closeCommandExtraFiles(cmd) // Also covers failures before launch.
+ 
+ 	cred, err := buildCredential(request.Uid, request.Gid)
+ 	if err != nil {
+@@ -262,7 +263,7 @@
+ 		c.tailStdPipe(stderrPath, request.Hooks.OnExecuteStderr, done)
+ 	})
+ 
+-	mp, err := launchManaged(cmd)
++	mp, err := launchWorkspaceCommand(cmd)
+ 	if err != nil {
+ 		close(done)
+ 		wg.Wait()
+@@ -393,6 +394,7 @@
+ 		cancel()
+ 		return fmt.Errorf("resolve cwd: %w", err)
+ 	}
++	defer closeCommandExtraFiles(cmd) // Also covers failures before launch.
+ 
+ 	cred, err := buildCredential(request.Uid, request.Gid)
+ 	if err != nil {
+@@ -414,7 +416,7 @@
+ 		defer devNull.Close()
+ 	}
+ 
+-	mp, err := launchManaged(cmd)
++	mp, err := launchWorkspaceCommand(cmd)
+ 	kernel := &commandKernel{
+ 		pid:          -1,
+ 		stdoutPath:   stdoutPath,
+@@ -486,6 +488,14 @@
+ 	return nil
+ }
+ 
++// launchWorkspaceCommand transfers inherited descriptors at Start and releases
++// the parent's copies on both success and failure. Background work must not keep
++// the envelope open in the supervisor for the lifetime of the command.
++func launchWorkspaceCommand(cmd *exec.Cmd) (*managedProcess, error) {
++	defer closeCommandExtraFiles(cmd)
++	return launchManaged(cmd)
++}
++
+ func newShellCommand(ctx context.Context, code string) *exec.Cmd {
+ 	return exec.CommandContext(ctx, getShell(), "-c", code)
+ }
 --- a/components/execd/pkg/runtime/types.go
 +++ b/components/execd/pkg/runtime/types.go
 @@ -15,6 +15,7 @@

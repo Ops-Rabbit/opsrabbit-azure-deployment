@@ -253,6 +253,8 @@ run "complete_public_aca_topology" {
         var.opensandbox_server_image_digest,
         local.opensandbox_runtime_image,
         var.opensandbox_max_sessions,
+        local.opensandbox_lifecycle_limits,
+        local.opensandbox_pool_id,
       ])) &&
       length([
         for setting in azurerm_container_app.opsrabbit[0].template[0].container[0].env : setting
@@ -273,7 +275,7 @@ run "complete_public_aca_topology" {
   }
 
   assert {
-    condition     = strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "--capabilities") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "c.resourceLimits===true")
+    condition     = strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "--capabilities") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "c.resourceLimits===true") && strcontains(azurerm_container_app.opsrabbit[0].template[0].init_container[0].args[0], "c.lifecycleLimits===true")
     error_message = "ACA bootstrap must reject backend images without the verified-install contract."
   }
 
@@ -377,6 +379,33 @@ run "complete_public_aca_topology" {
   assert {
     condition     = output.container_app_name == "ca-opsrabbit-test" && output.container_app_fqdn == "ca-opsrabbit-test.test.eastus2.azurecontainerapps.io" && output.opsrabbit_url == "https://ca-opsrabbit-test.test.eastus2.azurecontainerapps.io"
     error_message = "ACA outputs must expose the selected app and managed HTTPS URL."
+  }
+}
+
+# Only the pool name differs from complete_public_aca_topology. The expected
+# identity is independent of the production local so an omitted or stale pool
+# input cannot pass. The existing topology assertion checks generation wiring.
+run "pool_replacement_changes_aca_bootstrap_generation" {
+  command = plan
+
+  variables {
+    application_enabled   = true
+    opensandbox_pool_name = "replacementsessions"
+  }
+
+  assert {
+    condition = (
+      azapi_resource.opensandbox_pool_image_pull[0].name == "replacementsessions" &&
+      random_id.container_app_revision[0].keepers.opensandbox_bootstrap == sha512(jsonencode([
+        "https://ca-opensandbox.test.eastus2.azurecontainerapps.io",
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "opsrabbittestruntime.azurecr.io/opsrabbit/opensandbox-runtime@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        2,
+        { idleHours = 1, maxAgeDays = 1 },
+        "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-opsrabbit-test/providers/Microsoft.App/sessionPools/replacementsessions",
+      ]))
+    )
+    error_message = "A pool-only replacement must change the ACA revision keeper while endpoint, images, capacity and lifecycle remain unchanged."
   }
 }
 
@@ -846,6 +875,8 @@ run "runtime_registry_access_boundary" {
       jsondecode(local.opensandbox_bootstrap_json).image == local.opensandbox_runtime_image &&
       jsondecode(local.opensandbox_bootstrap_json).resourceLimits.cpu == "0.5" &&
       jsondecode(local.opensandbox_bootstrap_json).resourceLimits.memory == "1g" &&
+      jsondecode(local.opensandbox_bootstrap_json).lifecycleLimits.idleHours == 1 &&
+      jsondecode(local.opensandbox_bootstrap_json).lifecycleLimits.maxAgeDays == 1 &&
       one([for entry in azapi_resource.opensandbox[0].body.properties.template.containers[0].env : entry.value if entry.name == "AZURE_SESSION_IMAGE"]) == local.opensandbox_runtime_image
     )
     error_message = "The pool, controller and product bootstrap must use the same immutable image in the runtime-only registry."
