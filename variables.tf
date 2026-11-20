@@ -58,7 +58,7 @@ variable "deployment_target" {
 }
 
 variable "private_network" {
-  description = "Customer-owned subnets, private DNS zones, and internal origin required when network_mode is private."
+  description = "Customer-owned subnets, ACR/PostgreSQL private DNS zones, and internal origin required when network_mode is private. The installer creates the internal ACA environment's private DNS zone and VNet link."
   type = object({
     aci_subnet_id                  = optional(string)
     container_apps_subnet_id       = optional(string)
@@ -79,15 +79,17 @@ variable "private_network" {
 
   validation {
     condition = var.network_mode != "private" || var.private_network == null || (
-      var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id != null, false) : try(var.private_network.aci_subnet_id != null, false)
+      (var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id != null, false) : try(var.private_network.aci_subnet_id != null, false)) &&
+      (!(var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled) || try(var.private_network.container_apps_subnet_id != null, false))
     )
-    error_message = "private_network must supply the subnet required by deployment_target: aci_subnet_id for ACI or container_apps_subnet_id for ACA."
+    error_message = "private_network must supply the selected application subnet and a dedicated container_apps_subnet_id for the mandatory OpenSandbox controller."
   }
 
   validation {
     condition = var.private_network == null || alltrue([
       for subnet_id in compact([
         var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null),
+        (var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled) ? try(var.private_network.container_apps_subnet_id, null) : null,
         var.private_network.postgresql_subnet_id,
         var.private_network.private_endpoint_subnet_id,
       ]) : can(regex("(?i)^/subscriptions/[0-9a-f-]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/virtualNetworks/[^/]+/subnets/[^/]+$", subnet_id))
@@ -99,6 +101,7 @@ variable "private_network" {
     condition = var.private_network == null || alltrue([
       for subnet_id in compact([
         var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null),
+        (var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled) ? try(var.private_network.container_apps_subnet_id, null) : null,
         var.private_network.postgresql_subnet_id,
         var.private_network.private_endpoint_subnet_id,
       ]) : try(lower(split("/", subnet_id)[2]) == lower(var.subscription_id), false)
@@ -108,11 +111,24 @@ variable "private_network" {
 
   validation {
     condition = var.private_network == null || length(toset([
+      for subnet_id in compact([
+        var.deployment_target == "aca" ? try(var.private_network.container_apps_subnet_id, null) : try(var.private_network.aci_subnet_id, null),
+        (var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled) ? try(var.private_network.container_apps_subnet_id, null) : null,
+        var.private_network.postgresql_subnet_id,
+        var.private_network.private_endpoint_subnet_id,
+      ]) : try(lower(join("/", slice(split("/", subnet_id), 0, 9))), "invalid")
+    ])) == 1
+    error_message = "The application, OpenSandbox ACA, PostgreSQL, and ACR endpoint subnets must belong to the same virtual network."
+  }
+
+  validation {
+    condition = var.network_mode != "private" || var.private_network == null || length(toset(compact([
       var.deployment_target == "aca" ? try(lower(var.private_network.container_apps_subnet_id), "") : try(lower(var.private_network.aci_subnet_id), ""),
+      (var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled) ? try(lower(var.private_network.container_apps_subnet_id), "") : "",
       lower(var.private_network.postgresql_subnet_id),
       lower(var.private_network.private_endpoint_subnet_id),
-    ])) == 3
-    error_message = "The selected compute platform, PostgreSQL, and private endpoints must use three distinct subnets."
+    ]))) == (3 + ((var.deployment_target == "aci" && (var.container_group_enabled != null ? var.container_group_enabled : var.application_enabled)) ? 1 : 0))
+    error_message = "The selected compute platform, OpenSandbox ACA environment, PostgreSQL, and private endpoints must use distinct subnets (ACA compute and OpenSandbox may share their dedicated subnet)."
   }
 
   validation {
@@ -159,6 +175,22 @@ variable "container_registry_name" {
   validation {
     condition     = can(regex("^[a-zA-Z0-9]{5,50}$", var.container_registry_name))
     error_message = "container_registry_name must contain 5-50 alphanumeric characters."
+  }
+}
+
+variable "opensandbox_runtime_registry_name" {
+  description = "Globally unique ACR reserved only for sandbox runtime images. Defaults to a deterministic name derived from container_registry_name."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.opensandbox_runtime_registry_name == null || can(regex("^[a-z0-9]{5,50}$", var.opensandbox_runtime_registry_name))
+    error_message = "opensandbox_runtime_registry_name must contain 5-50 lowercase alphanumeric characters."
+  }
+
+  validation {
+    condition     = var.opensandbox_runtime_registry_name == null || try(var.opensandbox_runtime_registry_name != lower(var.container_registry_name), false)
+    error_message = "The sandbox runtime registry must be different from the application registry."
   }
 }
 
@@ -308,8 +340,65 @@ variable "container_app_name" {
   default     = "ca-opsrabbit"
 
   validation {
-    condition     = length(var.container_app_name) >= 2 && length(var.container_app_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.container_app_name))
+    condition     = length(var.container_app_name) >= 2 && length(var.container_app_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.container_app_name)) && !strcontains(var.container_app_name, "--")
     error_message = "container_app_name must contain 2-32 lowercase letters, numbers, or hyphens, start with a letter, and end with a letter or number."
+  }
+}
+
+variable "opensandbox_controller_name" {
+  description = "Azure Container App that exposes the authenticated OpenSandbox control plane."
+  type        = string
+  default     = "ca-opensandbox"
+
+  validation {
+    condition     = length(var.opensandbox_controller_name) >= 2 && length(var.opensandbox_controller_name) <= 32 && can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.opensandbox_controller_name)) && !strcontains(var.opensandbox_controller_name, "--")
+    error_message = "opensandbox_controller_name must be a valid Azure Container App name."
+  }
+}
+
+variable "opensandbox_pool_name" {
+  description = "Azure Dynamic Sessions pool name for OpenSandbox workspaces."
+  type        = string
+  default     = "opsrabbitsessions"
+
+  validation {
+    condition     = length(var.opensandbox_pool_name) >= 3 && length(var.opensandbox_pool_name) <= 63 && can(regex("^[a-z][a-z0-9]*$", var.opensandbox_pool_name))
+    error_message = "opensandbox_pool_name must contain 3-63 lowercase alphanumeric characters and start with a letter."
+  }
+}
+
+variable "opensandbox_server_image_digest" {
+  description = "Immutable ACR digest for the reviewed Azure OpenSandbox lifecycle server image."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.opensandbox_server_image_digest == null || can(regex("^sha256:[0-9a-f]{64}$", var.opensandbox_server_image_digest))
+    error_message = "opensandbox_server_image_digest must be a lowercase sha256 digest when supplied."
+  }
+}
+
+variable "opensandbox_runtime_image_digest" {
+  description = "Immutable ACR digest for the workspace-only OpenSandbox execution image."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.opensandbox_runtime_image_digest == null || can(regex("^sha256:[0-9a-f]{64}$", var.opensandbox_runtime_image_digest))
+    error_message = "opensandbox_runtime_image_digest must be a lowercase sha256 digest when supplied."
+  }
+}
+
+variable "opensandbox_max_sessions" {
+  description = "Maximum simultaneous Azure Dynamic Sessions allocated for this OpsRabbit installation."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.opensandbox_max_sessions >= 1 && var.opensandbox_max_sessions <= 100 && floor(var.opensandbox_max_sessions) == var.opensandbox_max_sessions
+    error_message = "opensandbox_max_sessions must be a whole number between 1 and 100."
   }
 }
 

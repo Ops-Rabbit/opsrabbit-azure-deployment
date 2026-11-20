@@ -10,7 +10,10 @@ provider "azurerm" {
       "Microsoft.ManagedIdentity",
       "Microsoft.Storage",
     ],
-    var.deployment_target == "aca" ? ["Microsoft.App"] : ["Microsoft.ContainerInstance"],
+    concat(
+      var.deployment_target == "aca" || local.application_enabled ? ["Microsoft.App"] : [],
+      var.deployment_target == "aci" ? ["Microsoft.ContainerInstance"] : [],
+    ),
     var.network_mode == "private" ? ["Microsoft.Network"] : [],
   )
 

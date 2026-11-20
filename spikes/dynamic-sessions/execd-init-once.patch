@@ -1,0 +1,64 @@
+--- a/components/execd/pkg/flag/flags.go
++++ b/components/execd/pkg/flag/flags.go
+@@ -55,4 +55,6 @@
+ 	// disabled, /internal/init is still accepted and becomes authoritative on apply,
+ 	// preserving legacy behavior for control planes that never call it.
+ 	RuntimeInit bool
++	// RuntimeInitOnce permanently locks initialization once the first validated initialization begins.
++	RuntimeInitOnce bool
+ )
+--- a/components/execd/pkg/flag/parser.go
++++ b/components/execd/pkg/flag/parser.go
+@@ -110,6 +110,7 @@
+ 		}
+ 		RuntimeInit = enabled
+ 	}
++	flag.BoolVar(&RuntimeInitOnce, "runtime-init-once", false, "Require a credential hash and reject runtime rebinding")
+ 	flag.BoolVar(&RuntimeInit, "runtime-init", RuntimeInit, "Gate preStart and the entrypoint on POST /internal/init; until then only /ping, /ready, and /internal/init are served")
+ 
+ 	// Parse flags - these will override environment variables if provided
+--- a/components/execd/main.go
++++ b/components/execd/main.go
+@@ -182,6 +182,7 @@
+ 	}
+ 
+ 	initManager := controller.InitRuntimeInitManager(&controller.RuntimeInitConfig{
++		OneShot: flag.RuntimeInitOnce,
+ 		Ctrl:              ctrl,
+ 		IsolatedResetter:  isolatedRunner,
+ 		LaunchEntrypoint:  entryLauncher(startInitEntrypoint),
+--- a/components/execd/pkg/web/controller/init_runtime.go
++++ b/components/execd/pkg/web/controller/init_runtime.go
+@@ -42,6 +42,8 @@
+ // needs to apply a RuntimeBinding. Nil pointers disable the corresponding
+ // step (e.g. no isolated runner, classic mode has no supervised entrypoint).
+ type RuntimeInitConfig struct {
++	// OneShot disallows rebinding, including after a failed initialization.
++	OneShot bool
+ 	Ctrl *runtime.Controller
+ 
+ 	// IsolatedResetter clears the previous generation's isolated sessions
+@@ -76,6 +78,7 @@
+ 	mu    sync.Mutex
+ 	ready atomic.Bool
+ 
++	initializationStarted bool
+ 	periodic *lifecycle.PeriodicManager
+ }
+ 
+@@ -220,6 +223,15 @@
+ 
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
++	if m.cfg.OneShot {
++		if m.initializationStarted {
++			return nil, model.ErrorCodeInvalidRequest, http.StatusConflict, errors.New("runtime initialization is permanently locked")
++		}
++		if !hasToken || req.PreserveRuntimeState {
++			return nil, model.ErrorCodeInvalidRequest, http.StatusBadRequest, errors.New("one-shot initialization requires a credential hash and full initialization")
++		}
++		m.initializationStarted = true
++	}
+ 	if req.PreserveRuntimeState {
+ 		m.applyBinding(req, tokenHash, hasToken)
+ 		m.MarkReady()

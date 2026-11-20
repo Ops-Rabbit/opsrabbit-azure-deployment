@@ -37,8 +37,8 @@ data "azurerm_virtual_network" "private" {
 }
 
 data "azapi_resource" "container_apps_subnet" {
-  for_each = local.private_network_enabled && var.deployment_target == "aca" && local.compute_subnet_id != null ? {
-    compute = local.compute_subnet_id
+  for_each = local.private_network_enabled && (var.deployment_target == "aca" || local.opensandbox_enabled) && try(var.private_network.container_apps_subnet_id, null) != null ? {
+    sessions = var.private_network.container_apps_subnet_id
   } : {}
 
   type                   = "Microsoft.Network/virtualNetworks/subnets@2024-05-01"
@@ -47,11 +47,12 @@ data "azapi_resource" "container_apps_subnet" {
 }
 
 resource "azurerm_container_registry" "opsrabbit" {
-  name                = var.container_registry_name
-  resource_group_name = var.resource_group_name
-  location            = var.location
-  sku                 = local.private_network_enabled ? "Premium" : "Basic"
-  admin_enabled       = false
+  name                 = var.container_registry_name
+  resource_group_name  = var.resource_group_name
+  location             = var.location
+  sku                  = local.private_network_enabled ? "Premium" : "Basic"
+  role_assignment_mode = "LegacyRegistryPermissions"
+  admin_enabled        = false
 
   public_network_access_enabled = !local.private_network_enabled
   anonymous_pull_enabled        = false
@@ -60,6 +61,8 @@ resource "azurerm_container_registry" "opsrabbit" {
   tags = var.tags
 
   lifecycle {
+    ignore_changes = [role_assignment_mode]
+
     precondition {
       condition = !local.private_network_enabled || alltrue([
         for network in data.azurerm_virtual_network.private :
@@ -107,6 +110,9 @@ resource "azurerm_user_assigned_identity" "aci_pull" {
 }
 
 resource "azurerm_role_assignment" "acr_pull" {
+  # Keep the legacy grant during upgrades until the repository-scoped reader
+  # grant has propagated and ACR has switched to ABAC. ACR ignores this role
+  # once the mode switch completes.
   scope                            = azurerm_container_registry.opsrabbit.id
   role_definition_name             = "AcrPull"
   principal_id                     = azurerm_user_assigned_identity.aci_pull.principal_id
@@ -114,6 +120,55 @@ resource "azurerm_role_assignment" "acr_pull" {
   skip_service_principal_aad_check = true
 }
 
+resource "azurerm_role_assignment" "acr_repository_reader" {
+  scope                            = azurerm_container_registry.opsrabbit.id
+  role_definition_name             = "Container Registry Repository Reader"
+  principal_id                     = azurerm_user_assigned_identity.aci_pull.principal_id
+  principal_type                   = "ServicePrincipal"
+  skip_service_principal_aad_check = true
+  condition                        = local.acr_application_reader_condition
+  condition_version                = "2.0"
+}
+
+# ACR ABAC role grants can take several minutes to reach the data plane. Keep
+# workload image pulls from racing that propagation after a fresh install or
+# when an identity/repository grant changes.
+resource "time_sleep" "acr_role_propagation" {
+  create_duration = "5m"
+  triggers = {
+    application_assignment       = azurerm_role_assignment.acr_repository_reader.id
+    application_condition        = local.acr_application_reader_condition
+    opensandbox_server           = local.opensandbox_enabled ? azurerm_role_assignment.opensandbox_acr_pull[0].id : "disabled"
+    opensandbox_server_acl       = local.opensandbox_enabled ? local.acr_opensandbox_server_reader_condition : "disabled"
+    opensandbox_runtime          = local.opensandbox_enabled ? azurerm_role_assignment.opensandbox_runtime_acr_pull[0].id : "disabled"
+    opensandbox_runtime_registry = azurerm_container_registry.opensandbox_runtime.id
+  }
+
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.acr_repository_reader,
+    azurerm_role_assignment.opensandbox_acr_pull,
+    azurerm_role_assignment.opensandbox_runtime_acr_pull,
+  ]
+}
+
+resource "azapi_update_resource" "acr_repository_mode" {
+  type        = "Microsoft.ContainerRegistry/registries@2025-11-01"
+  resource_id = azurerm_container_registry.opsrabbit.id
+
+  body = {
+    properties = {
+      roleAssignmentMode = "AbacRepositoryPermissions"
+    }
+  }
+
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    time_sleep.acr_role_propagation,
+  ]
+}
+
+# nosemgrep: terraform.azure.security.storage.storage-queue-services-logging.storage-queue-services-logging -- This account is used only for Azure Files shares; Queue service is not provisioned or used.
 resource "azurerm_storage_account" "opsrabbit" {
   name                = var.storage_account_name
   resource_group_name = var.resource_group_name
@@ -223,7 +278,7 @@ resource "azurerm_postgresql_flexible_server_database" "opsrabbit" {
 resource "azurerm_postgresql_flexible_server_configuration" "extensions" {
   name      = "azure.extensions"
   server_id = azurerm_postgresql_flexible_server.opsrabbit.id
-  value     = "VECTOR"
+  value     = "VECTOR,PG_TRGM"
 }
 
 resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
@@ -330,6 +385,30 @@ resource "azurerm_container_group" "opsrabbit" {
   image_registry_credential {
     server                    = azurerm_container_registry.opsrabbit.login_server
     user_assigned_identity_id = azurerm_user_assigned_identity.aci_pull.id
+  }
+
+  dynamic "init_container" {
+    for_each = local.opensandbox_enabled ? [1] : []
+    content {
+      name  = "sandbox-bootstrap"
+      image = local.backend_image
+      commands = [
+        "/bin/bash",
+        "-lc",
+        local.opensandbox_bootstrap_command,
+      ]
+      environment_variables = {
+        NODE_ENV                       = "production"
+        POSTGRES_HOST                  = azurerm_postgresql_flexible_server.opsrabbit.fqdn
+        OPENSANDBOX_BOOTSTRAP_REVISION = local.opensandbox_bootstrap_revision
+      }
+      secure_environment_variables = {
+        OPSRABBIT_NODE_DATABASE_URL   = local.postgresql_database_url
+        OPSRABBIT_NODE_ENCRYPTION_KEY = var.opsrabbit_encryption_key
+        BETTER_AUTH_SECRET            = var.better_auth_secret
+        OPENSANDBOX_BOOTSTRAP_JSON    = local.opensandbox_bootstrap_json
+      }
+    }
   }
 
   container {
@@ -462,6 +541,10 @@ resource "azurerm_container_group" "opsrabbit" {
 
   depends_on = [
     azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.acr_repository_reader,
+    time_sleep.acr_role_propagation,
+    azapi_update_resource.acr_repository_mode,
+    azapi_resource.opensandbox,
     azurerm_postgresql_flexible_server_firewall_rule.azure_services,
     azurerm_private_endpoint.container_registry,
     postgresql_extension.vector,

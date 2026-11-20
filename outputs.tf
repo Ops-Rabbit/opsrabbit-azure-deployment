@@ -18,6 +18,21 @@ output "backend_image" {
   value       = local.backend_image
 }
 
+output "opensandbox_runtime_registry_name" {
+  description = "Dedicated registry reserved exclusively for sandbox runtime images."
+  value       = azurerm_container_registry.opensandbox_runtime.name
+}
+
+output "opensandbox_runtime_registry_login_server" {
+  description = "Authenticated image endpoint for the dedicated sandbox runtime registry."
+  value       = azurerm_container_registry.opensandbox_runtime.login_server
+}
+
+output "opensandbox_runtime_image" {
+  description = "Immutable runtime image shared by the pool, controller and OpsRabbit bootstrap."
+  value       = local.opensandbox_runtime_image
+}
+
 output "backend_image_repository" {
   description = "Resolved backend repository inside the customer ACR."
   value       = local.backend_image_repository
@@ -69,21 +84,31 @@ output "container_group_name" {
 }
 
 output "container_app_environment_name" {
-  description = "Azure Container Apps environment name, or null when ACA is not selected."
-  value       = var.deployment_target == "aca" ? azurerm_container_app_environment.opsrabbit[0].name : null
+  description = "Azure Container Apps environment hosting the workload or mandatory OpenSandbox service."
+  value       = var.deployment_target == "aca" || local.opensandbox_enabled ? azurerm_container_app_environment.opsrabbit[0].name : null
 }
 
 output "container_app_name" {
-  description = "Azure Container App name, or null until the ACA workload is enabled."
-  value       = local.container_app_enabled ? azurerm_container_app.opsrabbit[0].name : null
+  description = "Azure Container App name, or null until the ACA workload is created."
+  value       = local.container_app_enabled ? try(azurerm_container_app.opsrabbit[0].name, null) : null
 }
 
 output "container_app_fqdn" {
-  description = "Azure Container App ingress FQDN, or null until the ACA workload is enabled."
-  value       = local.container_app_enabled ? azurerm_container_app.opsrabbit[0].ingress[0].fqdn : null
+  description = "Azure Container App ingress FQDN, or null until the ACA workload is created."
+  value       = local.container_app_enabled ? try(azurerm_container_app.opsrabbit[0].ingress[0].fqdn, null) : null
 }
 
 output "opsrabbit_url" {
   description = "OpsRabbit URL, or null until the selected application workload is enabled."
   value       = local.application_enabled ? local.application_origin : null
+}
+
+output "opensandbox_controller_endpoint" {
+  description = "Authenticated OpenSandbox lifecycle endpoint used by the installer-configured OpsRabbit backend."
+  value       = local.opensandbox_controller_origin
+}
+
+output "opensandbox_session_pool_endpoint" {
+  description = "Azure Dynamic Sessions management endpoint used privately by the OpenSandbox controller."
+  value       = local.opensandbox_enabled ? azapi_resource.opensandbox_pool_image_pull[0].output.properties.poolManagementEndpoint : null
 }
