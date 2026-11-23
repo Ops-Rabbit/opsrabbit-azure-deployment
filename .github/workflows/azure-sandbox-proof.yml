@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - 'spikes/dynamic-sessions/**'
+      - 'opensandbox/azure/**'
       - '.github/workflows/azure-sandbox-proof.yml'
 permissions:
   contents: read
@@ -32,33 +32,33 @@ jobs:
         run: |
           python3 -m venv /tmp/proof-lint
           /tmp/proof-lint/bin/pip install ruff==0.14.8
-          /tmp/proof-lint/bin/ruff check spikes/dynamic-sessions
-          /tmp/proof-lint/bin/ruff format --check spikes/dynamic-sessions
+          /tmp/proof-lint/bin/ruff check opensandbox/azure
+          /tmp/proof-lint/bin/ruff format --check opensandbox/azure
       - name: Verify isolated registry publication and scan gate
         run: |
-          bash -n spikes/dynamic-sessions/build-azure-images.sh
-          python3 spikes/dynamic-sessions/test_image_publisher.py
+          bash -n opensandbox/azure/build-azure-images.sh
+          python3 opensandbox/azure/test_image_publisher.py
       - name: Build pinned OpenSandbox server with Azure adapter
-        run: docker build -t opensandbox-azure-proof:ci -f spikes/dynamic-sessions/Dockerfile.server spikes/dynamic-sessions
+        run: docker build -t opensandbox-azure-proof:ci -f opensandbox/azure/Dockerfile.server opensandbox/azure
       - name: Adapter contract tests without network access
         run: >-
           docker run --rm --network none --entrypoint python
-          -v "$PWD/spikes/dynamic-sessions/test_azure_service.py:/tmp/test_azure_service.py:ro"
+          -v "$PWD/opensandbox/azure/test_azure_service.py:/tmp/test_azure_service.py:ro"
           opensandbox-azure-proof:ci /tmp/test_azure_service.py
       - name: PostgreSQL journal restart and least-privilege tests
         run: >-
           docker run --rm --network host --entrypoint python
           -e AZURE_SESSION_TEST_ADMIN_URL=postgresql://postgres:synthetic-ci-only@127.0.0.1:5432/opensandbox_test
-          -v "$PWD/spikes/dynamic-sessions/test_postgres_recovery.py:/tmp/test_postgres_recovery.py:ro"
+          -v "$PWD/opensandbox/azure/test_postgres_recovery.py:/tmp/test_postgres_recovery.py:ro"
           opensandbox-azure-proof:ci /tmp/test_postgres_recovery.py
       - name: Real upstream server startup and authentication
-        run: python3 spikes/dynamic-sessions/test-server-startup.py opensandbox-azure-proof:ci
+        run: python3 opensandbox/azure/test-server-startup.py opensandbox-azure-proof:ci
       - name: Runtime worker startup and supervision tests
-        run: python3 -m unittest discover -s spikes/dynamic-sessions -p 'test_runtime_*.py' -v
+        run: python3 -m unittest discover -s opensandbox/azure -p 'test_runtime_*.py' -v
       - name: Verify live acceptance probe offline
-        run: python3 -m unittest discover -s spikes/dynamic-sessions -p 'test_verify_end_to_end.py' -v
+        run: python3 -m unittest discover -s opensandbox/azure -p 'test_verify_end_to_end.py' -v
       - name: Build runtime and run one-shot initialization regressions
-        run: docker build -t opensandbox-azure-runtime:ci -f spikes/dynamic-sessions/Dockerfile.runtime spikes/dynamic-sessions
+        run: docker build -t opensandbox-azure-runtime:ci -f opensandbox/azure/Dockerfile.runtime opensandbox/azure
       - name: Report runtime image vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python3 -u spikes/dynamic-sessions/test-runtime-container.py opensandbox-azure-runtime:ci --ci-apparmor 2>&1 | tee runtime-container-evidence.log
+          python3 -u opensandbox/azure/test-runtime-container.py opensandbox-azure-runtime:ci --ci-apparmor 2>&1 | tee runtime-container-evidence.log
       - name: Retain image vulnerability evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

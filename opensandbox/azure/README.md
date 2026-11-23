@@ -72,15 +72,15 @@ unsupported.
 ```sh
 python3 -m venv /tmp/azure-proof-lint
 /tmp/azure-proof-lint/bin/pip install ruff==0.14.8
-/tmp/azure-proof-lint/bin/ruff check spikes/dynamic-sessions
-/tmp/azure-proof-lint/bin/ruff format --check spikes/dynamic-sessions
+/tmp/azure-proof-lint/bin/ruff check opensandbox/azure
+/tmp/azure-proof-lint/bin/ruff format --check opensandbox/azure
 
 docker build --platform linux/amd64 -t opensandbox-azure-proof:test \
-  -f spikes/dynamic-sessions/Dockerfile.server spikes/dynamic-sessions
+  -f opensandbox/azure/Dockerfile.server opensandbox/azure
 docker run --rm --platform linux/amd64 --network none --entrypoint python \
-  -v "$PWD/spikes/dynamic-sessions/test_azure_service.py:/tmp/test_azure_service.py:ro" \
+  -v "$PWD/opensandbox/azure/test_azure_service.py:/tmp/test_azure_service.py:ro" \
   opensandbox-azure-proof:test /tmp/test_azure_service.py
-python3 spikes/dynamic-sessions/test-server-startup.py opensandbox-azure-proof:test
+python3 opensandbox/azure/test-server-startup.py opensandbox-azure-proof:test
 ```
 
 The customer image publication helper also requires Skopeo; it scans the OCI
@@ -94,9 +94,9 @@ transitive lock in `requirements-server.txt`; narrow Azure patches still fail
 the build if the expected upstream interfaces change. To refresh the lock:
 
 ```sh
-uv pip compile spikes/dynamic-sessions/requirements-server.in \
+uv pip compile opensandbox/azure/requirements-server.in \
   --python-version 3.12 --python-platform x86_64-unknown-linux-musl \
-  --generate-hashes --output-file spikes/dynamic-sessions/requirements-server.txt
+  --generate-hashes --output-file opensandbox/azure/requirements-server.txt
 ```
 
 Alpine uses musl rather than glibc. The runtime includes Bash, GNU coreutils,
@@ -120,7 +120,7 @@ in command arguments, logs or the repository. The runner validates TLS and uses
 only synthetic data. Run from the repository root:
 
 ```sh
-python3 spikes/dynamic-sessions/verify-end-to-end.py \
+python3 opensandbox/azure/verify-end-to-end.py \
   --url 'https://<controller-fqdn>' \
   --key-file '<private-directory>/server-api-key' \
   --image '<registry>/opensandbox-runtime@sha256:<digest>' \

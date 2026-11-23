@@ -28,7 +28,7 @@ and file transfers to `/workspace`, including requests that bypass OpsRabbit.
 Browser automation is not supported by this Azure runtime yet.
 
 For architecture, security boundaries, controller recovery and contributor tests,
-see the [OpenSandbox technical guide](spikes/dynamic-sessions/README.md).
+see the [OpenSandbox technical guide](opensandbox/azure/README.md).
 
 ## Security modes
 
@@ -70,7 +70,7 @@ The exact provider versions are pinned in `versions.tf` and checksummed in
 | `main.tf` | Azure and PostgreSQL resources |
 | `container-apps.tf` | Azure Container Apps resources |
 | `opensandbox.tf` | Dynamic Sessions pool, separate executor and image-pull identities, controller and durable journal role |
-| `spikes/dynamic-sessions/` | Pinned Azure adapter/runtime images, contract tests and customer build helper |
+| `opensandbox/azure/` | Pinned Azure adapter/runtime images, contract tests and customer build helper |
 | `outputs.tf` | Deployment addresses and resource names |
 | `terraform.tfvars.example` | Secret-free customer input example |
 | `backend.tf.example` | Remote Azure state-backend example |
@@ -521,8 +521,8 @@ These images contain the Azure Dynamic Sessions adapter and the restricted
 workspace runtime. Build them from this checkout after the bootstrap apply:
 
 ```bash
-chmod +x spikes/dynamic-sessions/build-azure-images.sh
-spikes/dynamic-sessions/build-azure-images.sh \
+chmod +x opensandbox/azure/build-azure-images.sh
+opensandbox/azure/build-azure-images.sh \
   "$(terraform output -raw container_registry_name)" \
   "$(terraform output -raw opensandbox_runtime_registry_name)" \
   "<unique-build-tag>"
