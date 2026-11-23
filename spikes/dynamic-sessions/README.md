@@ -1,15 +1,17 @@
-# OpenSandbox on Azure Dynamic Sessions — feasibility proof
+# OpenSandbox on Azure Dynamic Sessions — technical guide
 
-This proof runs the actual OpenSandbox lifecycle server on Azure Container Apps.
+OpenSandbox runs on Azure Container Apps and creates isolated command/file
+workspaces using Azure Container Apps Dynamic Sessions.
 An `AzureSandboxService` implementation allocates custom-container Dynamic
 Sessions. The upstream server proxy forwards execution requests through a
 loopback bridge that adds Azure authentication and a per-session execd credential. The custom image runs the actual
 upstream `execd` binary. There is no AKS cluster, VM, Docker daemon, or native
 Azure-only replacement for the OpenSandbox API.
 
-This directory contains the Azure Dynamic Sessions adapter and installer
-integration for the customer deployment path. OpenSandbox is provisioned as
-part of an enabled application deployment; browser execution remains unsupported.
+For installation, upgrades and troubleshooting, follow the [customer README](../../README.md).
+This guide covers the adapter, security boundaries, recovery and contributor tests.
+OpenSandbox is required for every enabled application deployment; browser
+execution is unsupported by this runtime.
 
 ## Supported contract
 
@@ -20,9 +22,8 @@ part of an enabled application deployment; browser execution remains unsupported
 - Configurable concurrent sessions, fixed 0.5 CPU/1Gi shape, explicit 60–3600
   second maximum lifetime. Azure may delete an idle sandbox at the 3600-second
   cooldown before its requested absolute expiry.
-  Azure rejected a zero-ready-instance pool configuration in this subscription;
-  this proof retains one ready instance and does not claim scale-to-zero cold-start
-  acceptance.
+  The installer retains one ready instance. Scale-to-zero cold starts are not
+  qualified.
 - Only execd port 44772 is exposed through the OpenSandbox proxy; the Azure
   container itself listens on port 8080.
 - Absolute lifetime enforcement and cleanup retry while the controller is alive.
@@ -49,12 +50,10 @@ that dedicated registry. No controller key or
 Azure access token is forwarded into the execution container or returned in
 endpoint metadata.
 
-The original standalone proof restricted HTTPS controller ingress to the
-walkthrough client's public IP. The customer Terraform public mode has no IP
-allowlist: its HTTPS controller ingress is public and requires the API key.
-Private mode uses the internal ACA environment. The Azure pool gateway requires
-Entra authentication, and the pool has `EgressDisabled`. The historical public
-proof does not qualify the private customer network topology.
+In public mode, the controller has public HTTPS ingress with API-key authentication
+and no IP allowlist. Private mode uses the internal ACA environment. The Azure
+pool gateway requires Entra authentication, and the pool has `EgressDisabled`.
+Public-mode tests do not qualify a customer's private network topology.
 
 Bubblewrap starts **execd itself** in a restricted view. `/workspace` and a private
 `/tmp` are writable; `/usr` and the execd binary are read-only. Host `/etc` and
@@ -109,43 +108,16 @@ package database remain intact for scanning and maintenance.
 CI runs the contract tests and real upstream startup/authentication checks without
 Azure credentials or provisioning cloud resources.
 
-## Historical adapter proof deployment
+## Live verification
 
-The steps below record the original standalone adapter experiment. They are not
-the current customer installation procedure: its repository-conditioned runtime
-pull grant did not work with the subsequently validated Dynamic Sessions API.
-For a new installation, follow the [root README](../../README.md), which provisions
-a dedicated runtime-only ACR, separate identities, durable controller storage,
-and automatic OpsRabbit configuration through Terraform. Use the verification
-command below against that installation's controller and runtime image outputs.
+Deploy using the [customer README](../../README.md), then verify the exact
+controller endpoint and runtime image digest from that installation. Confirm the
+active session-pool template uses that digest, has a ready instance and has no
+image-pull failures. An ARM resource marked Succeeded alone is insufficient.
 
-Use a dedicated test resource group and retain exact resource names in a private
-inventory. Never put credentials or customer-specific resource IDs in this repo.
-
-1. Create a Consumption Container Apps environment and ACR with registry admin
-   credentials disabled.
-2. Build/publish `Dockerfile.runtime` and `Dockerfile.server`; resolve both tags to
-   immutable registry digests before deployment.
-3. Create an image-pull identity and assign `Container Registry Repository Reader`
-   with an ABAC condition limited to `opsrabbit/opensandbox-runtime`.
-4. Create a `Microsoft.App/sessionPools` custom-container Dynamic pool using the
-   environment, runtime digest, port 8080, 0.5 CPU/1Gi, two maximum sessions, one
-   ready instance, 3600-second timed idle cooldown, `EgressDisabled`, and image-pull
-   identity lifecycle `None`. ARM API `2025-07-01` was used to deploy it; API
-   `2026-07-01` exposes template rollout and readiness details.
-5. Create a separate controller identity. Grant it Azure ContainerApps Session Executor on this pool
-   and repository-scoped `Container Registry Repository Reader` for
-   `opsrabbit/opensandbox-server`. Do not grant these permissions to sessions.
-6. Deploy the server digest as a single-replica Container App, with HTTPS-only
-   port 8080 ingress and an IP allowlist for the test client. Inject a strong
-   generated `OPENSANDBOX_API_KEY` using an ACA secret, not plaintext checked-in
-   configuration. Configure `AZURE_CLIENT_ID`, `AZURE_SESSION_IMAGE` (the same
-   runtime digest), and `AZURE_SESSION_ENDPOINT` (exact HTTPS pool endpoint).
-7. Wait for the **active** pool template to reference the expected image and show
-   a ready instance, and for the controller revision to be healthy. An ARM
-   resource marked Succeeded alone is insufficient.
-8. Run the verification below. Keep the local key file private (mode 0600 in a
-   mode-0700 directory). The runner uses Python's default TLS certificate checks.
+Keep the API key in a mode-0600 file inside a private mode-0700 directory, never
+in command arguments, logs or the repository. The runner validates TLS and uses
+only synthetic data. Run from the repository root:
 
 ```sh
 python3 spikes/dynamic-sessions/verify-end-to-end.py \
@@ -188,27 +160,22 @@ an init container. Existing administrator settings are preserved. Application
 startup is blocked if the real OpenSandbox command, file round-trip, or confirmed
 cleanup check fails.
 
-## Limits before customer release
+## Limitations and release checks
+
 - Azure metadata-read plus dispatch is not atomic against external administrators.
   The runtime initialization gate and per-session credential prevent stale
   execution on replacement containers, but external interference may still cause
   a rejected request to allocate an idle replacement. Restrict executor access
   to the controller and keep each pool dedicated to this deployment.
-- Tenant authorization belongs to the trusted caller in this proof. It is not
-  acceptance of OpsRabbit multi-tenant authorization or upstream tenant mode.
+- Tenant authorization belongs to OpsRabbit as the trusted caller. Adapter tests
+  do not establish OpsRabbit multi-tenant authorization or upstream tenant mode.
 - The minimal runtime, denied egress and fixed image cannot satisfy all
   OpsRabbit tool workloads. Browser execution, sustained concurrency,
   customer-network acceptance and multi-replica coordination remain unsupported.
-- Historical Debian images reported 47 High findings each. New images must pass
-  the High/Critical gate; download the exact commit's JSON scan artifacts from
-  the Azure OpenSandbox proof workflow before release. A scan result does not
-  replace live Azure qualification of a changed runtime base.
+- Runtime and controller images must pass the High/Critical gate. Review the
+  exact commit's JSON scan artifacts from the Azure OpenSandbox proof workflow
+  before release. Scan application images separately; a synthetic-QA exception
+  is not customer-release approval. A clean scan does not replace live Azure
+  qualification of a changed runtime base.
 - A centrally managed release image pipeline remains necessary; the current
   helper builds, scans and publishes to the customer's ACR.
-
-The walkthrough retention instruction was superseded by the user's teardown
-request on 12 November 2026. The recorded teardown completed that day; only two
-image registries and separate Terraform-state storage were retained. See the
-[historical deployment and teardown report](../../docs/qa-runs/2026-11-12-SKILLS-156-native-azure-chat.md).
-The resumed work is local fixes/tests/reviews only; no new deployment or merge
-is authorized. No fresh live inventory check is claimed.

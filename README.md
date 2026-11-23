@@ -27,6 +27,9 @@ The first Azure integration confines both direct OpenSandbox command requests
 and file transfers to `/workspace`, including requests that bypass OpsRabbit.
 Browser automation is not supported by this Azure runtime yet.
 
+For architecture, security boundaries, controller recovery and contributor tests,
+see the [OpenSandbox technical guide](spikes/dynamic-sessions/README.md).
+
 ## Security modes
 
 Private networking is recommended for production and customer environments. It
