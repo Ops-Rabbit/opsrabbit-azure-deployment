@@ -1,0 +1,8 @@
+apiVersion: v2
+name: opsrabbit
+description: OpsRabbit on Azure Kubernetes Service
+type: application
+version: 0.1.0
+keywords: [opsrabbit, aks, kubernetes]
+sources:
+  - https://github.com/Ops-Rabbit/opsrabbit-gcp-deployment/tree/main/charts/opsrabbit

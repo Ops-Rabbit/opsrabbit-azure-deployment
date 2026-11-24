@@ -1,0 +1,17 @@
+{{- if ne (int .Values.replicaCount.backend) 1 }}
+{{- fail "OpsRabbit requires exactly one backend replica with Recreate updates" }}
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+{{- fail "AKS requires persistent storage; use persistence.existingClaim to reuse a volume" }}
+{{- end }}
+{{- if not (regexMatch "^https://[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$" .Values.applicationOrigin) }}
+{{- fail "applicationOrigin must be an HTTPS hostname without a path, port or trailing slash" }}
+{{- end }}
+{{- range $name, $image := dict "backend" .Values.image.backend "web" .Values.image.web }}
+{{- if not (regexMatch "^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$" $image) }}
+{{- fail (printf "image.%s must be an immutable image reference ending @sha256:<64 hex characters>" $name) }}
+{{- end }}
+{{- end }}
+{{- if not .Values.secrets.existingSecret }}
+{{- fail "secrets.existingSecret is required; secret values must not be stored in Helm values" }}
+{{- end }}

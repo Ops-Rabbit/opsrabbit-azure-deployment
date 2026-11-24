@@ -1,0 +1,19 @@
+subscription_id         = "00000000-0000-0000-0000-000000000000"
+name_prefix             = "opsrabbit"
+location                = "eastus2"
+container_registry_name = "replacewithuniqueacrname"
+postgresql_server_name  = "replace-with-unique-postgresql-name"
+admin_group_object_ids  = ["00000000-0000-0000-0000-000000000000"]
+
+# Alternatively, set admin_group_object_ids=[] and grant the operator directly:
+# admin_principal_object_ids = ["00000000-0000-0000-0000-000000000000"]
+
+# The default Kubernetes API is private. Connect Helm/kubectl via VPN, peering
+# with DNS forwarding, or a VNet-connected runner.
+private_cluster_enabled = true
+
+# Optional public API, restricted to your operator/CI egress addresses:
+# private_cluster_enabled         = false
+# api_server_authorized_ip_ranges = ["203.0.113.10/32"]
+
+# Supply TF_VAR_postgresql_administrator_password separately.

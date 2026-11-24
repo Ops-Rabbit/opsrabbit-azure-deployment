@@ -1,0 +1,110 @@
+# Images must be approved linux/amd64 release images copied into the customer ACR.
+image:
+  backend: ""
+  web: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+applicationOrigin: ""
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount:
+  backend: 1
+  web: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+backend:
+  containerPort: 8384
+  servicePort: 8384
+  imagePullPolicy: ""
+  env: {}
+  command: []
+  args: []
+  # Runtime tools also write to home/cache paths outside the four PVC subpaths.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: [ALL]
+
+web:
+  containerPort: 8080
+  imagePullPolicy: ""
+  env: {}
+  command: []
+  args: []
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+
+resources:
+  backend:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  web:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+secrets:
+  existingSecret: opsrabbit-runtime
+  databaseUrlKey: DATABASE_URL
+  betterAuthSecretKey: BETTER_AUTH_SECRET
+  encryptionKeyKey: OPSRABBIT_NODE_ENCRYPTION_KEY
+
+tls:
+  existingSecret: opsrabbit-tls
+  # Optional externally managed HTTP-01 challenge files, shared by all web pods.
+  acmeChallengeConfigMap: ""
+
+service:
+  # Change to false to provision a public Azure load balancer.
+  internal: true
+  annotations: {}
+  loadBalancerSourceRanges: []
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  # Empty uses the chart's Azure Disk CSI StorageClass with reclaimPolicy Retain.
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  size: 100Gi
+  subdirectories: [.opsrabbit, git, .agent-browser, .codex]
+
+nodeSelector:
+  kubernetes.io/os: linux
+  kubernetes.io/arch: amd64
+tolerations: []
+affinity: {}
