@@ -9,7 +9,7 @@ terraform {
 
     azapi = {
       source  = "Azure/azapi"
-      version = "2.12.0"
+      version = "2.14.0"
     }
 
     postgresql = {
