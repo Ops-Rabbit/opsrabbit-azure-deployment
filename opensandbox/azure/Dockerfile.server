@@ -1,0 +1,17 @@
+FROM python:3.12-alpine3.24@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
+COPY requirements-server.txt /tmp/requirements-server.txt
+RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r /tmp/requirements-server.txt \
+ && mkdir -p /app \
+ && python -c 'import importlib.util, shutil; shutil.copytree(importlib.util.find_spec("opensandbox_server").submodule_search_locations[0], "/app/opensandbox_server")' \
+ && addgroup -g 10001 opensandbox && adduser -D -u 10001 -G opensandbox opensandbox
+ENV PYTHONPATH=/app
+WORKDIR /app
+COPY patch-server.py /tmp/patch-server.py
+RUN python /tmp/patch-server.py
+COPY azure_service.py /app/opensandbox_server/services/azure_service.py
+COPY server-start.py /opt/server-start.py
+RUN python -m compileall -q /app/opensandbox_server
+USER 10001:10001
+ENTRYPOINT ["python", "/opt/server-start.py"]
+CMD []
